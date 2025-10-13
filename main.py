@@ -1,132 +1,118 @@
-import asyncio, re
+# main.py
+import os
+import asyncio
+import logging
 from datetime import datetime
-from typing import Optional
+from typing import List
 
 import pytz
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.filters import Command
 from aiogram.enums import ParseMode
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.types import Message
 
-from utils.config import BOT_TOKEN, CHANNEL_ID, ADMINS, TZ
-from utils.logging import logger
-from utils.keyboards import post_actions_kb, cta_kb
-from storage.db import init_db, get_conn
-from scheduler import setup_scheduler, add_schedule
+# ── Конфиг из переменных окружения ────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channel_name или -1001234567890
+ADMINS_RAW = os.getenv("ADMINS", "").strip()      # список id через запятую
+TZ = os.getenv("TZ", "Europe/Moscow").strip()
 
-tz = pytz.timezone(TZ)
-DRAFTS: dict[str, dict] = {}
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан (env).")
+if not CHANNEL_ID:
+    raise RuntimeError("CHANNEL_ID не задан (env).")
 
-class CreatePostSG(StatesGroup):
-    text = State()
-    cta_text = State()
-    cta_url = State()
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMINS if ADMINS else True
-
-async def publish(bot: Bot, text: str, cta_text: Optional[str] = None, cta_url: Optional[str] = None):
-    kb = cta_kb(cta_text, cta_url) if (cta_text and cta_url) else None
-    await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-async def dispatch_post(bot: Bot, job_id: int):
-    with get_conn() as con:
-        row = con.execute("SELECT * FROM schedules WHERE id=?", (job_id,)).fetchone()
-        if not row or row["status"] != "scheduled":
-            return
+# распарсим админов
+def _parse_admins(s: str) -> List[int]:
+    out = []
+    for part in s.replace(" ", "").split(","):
+        if not part:
+            continue
         try:
-            await publish(bot, row["text"], row["cta_text"], row["cta_url"])
-            con.execute("UPDATE schedules SET status='done' WHERE id=?", (job_id,))
-            con.commit()
-        except Exception:
-            logger.exception("Publish failed")
-            con.execute("UPDATE schedules SET status='failed' WHERE id=?", (job_id,))
-            con.commit()
+            out.append(int(part))
+        except ValueError:
+            # пропускаем то, что не int
+            continue
+    return out
 
-def parse_schedule_cmd(full_text: str):
-    m = re.search(r'\"(.+?)\"', full_text)
-    if not m:
-        return None
-    post_text = m.group(1).strip()
-    rest = full_text[m.end():].strip()
-    m2 = re.match(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})', rest)
-    if not m2:
-        return None
-    dt_str = f"{m2.group(1)} {m2.group(2)}"
-    dt_local = tz.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
-    cta_text = cta_url = None
-    m3 = re.search(r'\[(.+?)\]', rest[m2.end():].strip())
-    if m3:
-        parts = m3.group(1).split("|", 1)
-        if len(parts) == 2:
-            cta_text, cta_url = parts[0].strip(), parts[1].strip()
-    return post_text, dt_local, cta_text, cta_url
+ADMINS: List[int] = _parse_admins(ADMINS_RAW)
+TZINFO = pytz.timezone(TZ)
 
-async def main():
-    init_db()
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    scheduler = setup_scheduler(lambda job_id=None: asyncio.create_task(dispatch_post(bot, job_id)))
+# ── Логирование ───────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("layoutplace_bot")
 
-    @dp.message(Command("start"))
-async def cmd_start(m: Message):
-    await m.answer(
-        "Готов к работе.\n"
-        "/myid – показать твой Telegram ID\n"
-        "/post <текст> – опубликовать сразу\n"
-        "/schedule \"Текст\" YYYY-MM-DD HH:MM [Кнопка|https://...]\n"
-        "/queue – список запланированных\n"
-        "/cancel <id> – отменить задачу\n"
-        "/now – текущее время (TZ)",
-        parse_mode=None
+
+# ── Хелперы ───────────────────────────────────────────────────────────────────
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS if ADMINS else True  # если список пуст — все админы
+
+async def send_to_channel(bot: Bot, text: str) -> None:
+    await bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        disable_web_page_preview=True,   # чтобы ссылки не раздували пост
     )
 
-    @dp.message(Command("myid"))
-    async def cmd_myid(m: Message):
-        await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
 
-    @dp.message(Command("now"))
-    async def cmd_now(m: Message):
-        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-        await m.answer(f"Серверное время: {now} ({TZ})")
+# ── Хендлеры ──────────────────────────────────────────────────────────────────
+async def on_start(message: Message, bot: Bot):
+    # ВКЛЮЧАЕМ БЕЗ РАЗМЕТКИ: parse_mode=None → иначе <текст> воспримется как тег
+    text = (
+        "Готов к работе.\n"
+        "/myid — показать твой Telegram ID\n"
+        "/post <текст> — опубликовать сразу в канал\n"
+        "/now — текущее время (TZ)\n"
+        "\n"
+        f"Канал: {CHANNEL_ID}  •  TZ: {TZ}"
+    )
+    await message.answer(text, parse_mode=None)
 
-    @dp.message(Command("post"))
-    async def cmd_post(m: Message):
-        if not is_admin(m.from_user.id):
-            return await m.answer("Нет прав.")
-        text = m.text.partition(" ")[2].strip()
-        if not text:
-            return await m.answer("Добавь текст: /post текст поста")
-        await publish(bot, text)
-        await m.answer("Опубликовано ✅")
+async def on_myid(message: Message):
+    await message.answer(f"Твой Telegram ID: <code>{message.from_user.id}</code>")
 
-    @dp.message(Command("schedule"))
-    async def cmd_schedule(m: Message):
-        if not is_admin(m.from_user.id):
-            return await m.answer("Нет прав.")
-        parsed = parse_schedule_cmd(m.text)
-        if not parsed:
-            return await m.answer('Формат: /schedule "Текст поста" 2025-10-14 10:30 [Кнопка|https://...]')
-        post_text, dt_local, cta_text, cta_url = parsed
-        if dt_local <= datetime.now(tz):
-            return await m.answer("Время уже прошло. Укажи будущий момент.")
-        with get_conn() as con:
-            cur = con.execute(
-                "INSERT INTO schedules(text, cta_text, cta_url, run_at) VALUES(?,?,?,?)",
-                (post_text, cta_text, cta_url, dt_local.strftime("%Y-%m-%d %H:%M:%S"))
-            )
-            job_id = cur.lastrowid
-            con.commit()
-        add_schedule(scheduler, dt_local, lambda job_id=None: asyncio.create_task(dispatch_post(bot, job_id)), job_id)
-        await m.answer(f"Запланировано ✅ ID: <code>{job_id}</code>\nКогда: {dt_local.strftime('%Y-%m-%d %H:%M')} ({TZ})")
+async def on_now(message: Message):
+    now = datetime.now(TZINFO).strftime("%Y-%m-%d %H:%M:%S")
+    await message.answer(f"Серверное время: <b>{now}</b>  <i>({TZ})</i>")
+
+async def on_post(message: Message, bot: Bot):
+    if not is_admin(message.from_user.id):
+        return await message.answer("Нет прав.")
+
+    # Берём всё после пробела: "/post <текст>"
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await message.answer("Использование: <code>/post Текст поста</code>")
+
+    text = parts[1].strip()
+    await send_to_channel(bot, text)
+    await message.answer("✅ Отправлено в канал.")
+
+
+# ── Запуск ────────────────────────────────────────────────────────────────────
+async def main():
+    bot = Bot(BOT_TOKEN, default=ParseMode.HTML)        # глобально HTML ОК
+    dp = Dispatcher()
+
+    # Регистрация хендлеров (aiogram v3)
+    dp.message.register(on_start, Command("start"))
+    dp.message.register(on_myid, Command("myid"))
+    dp.message.register(on_now, Command("now"))
+    dp.message.register(on_post, Command("post"))
 
     me = await bot.get_me()
-    logger.info(f"Запущен бот @{me.username} для канала {CHANNEL_ID} (TZ {TZ})")
+    logger.info(
+        f"Запущен бот @{me.username} для канала {CHANNEL_ID} (TZ {TZ})"
+    )
+
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Остановлен.")
