@@ -1,0 +1,129 @@
+import asyncio, re
+from datetime import datetime
+from typing import Optional
+
+import pytz
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.enums import ParseMode
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+
+from utils.config import BOT_TOKEN, CHANNEL_ID, ADMINS, TZ
+from utils.logging import logger
+from utils.keyboards import post_actions_kb, cta_kb
+from storage.db import init_db, get_conn
+from scheduler import setup_scheduler, add_schedule
+
+tz = pytz.timezone(TZ)
+DRAFTS: dict[str, dict] = {}
+
+class CreatePostSG(StatesGroup):
+    text = State()
+    cta_text = State()
+    cta_url = State()
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS if ADMINS else True
+
+async def publish(bot: Bot, text: str, cta_text: Optional[str] = None, cta_url: Optional[str] = None):
+    kb = cta_kb(cta_text, cta_url) if (cta_text and cta_url) else None
+    await bot.send_message(chat_id=CHANNEL_ID, text=text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+async def dispatch_post(bot: Bot, job_id: int):
+    with get_conn() as con:
+        row = con.execute("SELECT * FROM schedules WHERE id=?", (job_id,)).fetchone()
+        if not row or row["status"] != "scheduled":
+            return
+        try:
+            await publish(bot, row["text"], row["cta_text"], row["cta_url"])
+            con.execute("UPDATE schedules SET status='done' WHERE id=?", (job_id,))
+            con.commit()
+        except Exception:
+            logger.exception("Publish failed")
+            con.execute("UPDATE schedules SET status='failed' WHERE id=?", (job_id,))
+            con.commit()
+
+def parse_schedule_cmd(full_text: str):
+    m = re.search(r'\"(.+?)\"', full_text)
+    if not m:
+        return None
+    post_text = m.group(1).strip()
+    rest = full_text[m.end():].strip()
+    m2 = re.match(r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})', rest)
+    if not m2:
+        return None
+    dt_str = f"{m2.group(1)} {m2.group(2)}"
+    dt_local = tz.localize(datetime.strptime(dt_str, "%Y-%m-%d %H:%M"))
+    cta_text = cta_url = None
+    m3 = re.search(r'\[(.+?)\]', rest[m2.end():].strip())
+    if m3:
+        parts = m3.group(1).split("|", 1)
+        if len(parts) == 2:
+            cta_text, cta_url = parts[0].strip(), parts[1].strip()
+    return post_text, dt_local, cta_text, cta_url
+
+async def main():
+    init_db()
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+    scheduler = setup_scheduler(lambda job_id=None: asyncio.create_task(dispatch_post(bot, job_id)))
+
+    @dp.message(Command("start"))
+    async def cmd_start(m: Message):
+        await m.answer("Готов к работе.\n"
+                       "/myid — показать твой Telegram ID\n"
+                       "/post <текст> — опубликовать сразу\n"
+                       "/schedule \"Текст\" YYYY-MM-DD HH:MM [Кнопка|https://...]\n"
+                       "/queue — список запланированных\n"
+                       "/cancel <id> — отменить задачу\n"
+                       "/now — текущее время (TZ)")
+
+    @dp.message(Command("myid"))
+    async def cmd_myid(m: Message):
+        await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
+
+    @dp.message(Command("now"))
+    async def cmd_now(m: Message):
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        await m.answer(f"Серверное время: {now} ({TZ})")
+
+    @dp.message(Command("post"))
+    async def cmd_post(m: Message):
+        if not is_admin(m.from_user.id):
+            return await m.answer("Нет прав.")
+        text = m.text.partition(" ")[2].strip()
+        if not text:
+            return await m.answer("Добавь текст: /post текст поста")
+        await publish(bot, text)
+        await m.answer("Опубликовано ✅")
+
+    @dp.message(Command("schedule"))
+    async def cmd_schedule(m: Message):
+        if not is_admin(m.from_user.id):
+            return await m.answer("Нет прав.")
+        parsed = parse_schedule_cmd(m.text)
+        if not parsed:
+            return await m.answer('Формат: /schedule "Текст поста" 2025-10-14 10:30 [Кнопка|https://...]')
+        post_text, dt_local, cta_text, cta_url = parsed
+        if dt_local <= datetime.now(tz):
+            return await m.answer("Время уже прошло. Укажи будущий момент.")
+        with get_conn() as con:
+            cur = con.execute(
+                "INSERT INTO schedules(text, cta_text, cta_url, run_at) VALUES(?,?,?,?)",
+                (post_text, cta_text, cta_url, dt_local.strftime("%Y-%m-%d %H:%M:%S"))
+            )
+            job_id = cur.lastrowid
+            con.commit()
+        add_schedule(scheduler, dt_local, lambda job_id=None: asyncio.create_task(dispatch_post(bot, job_id)), job_id)
+        await m.answer(f"Запланировано ✅ ID: <code>{job_id}</code>\nКогда: {dt_local.strftime('%Y-%m-%d %H:%M')} ({TZ})")
+
+    me = await bot.get_me()
+    logger.info(f"Запущен бот @{me.username} для канала {CHANNEL_ID} (TZ {TZ})")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
