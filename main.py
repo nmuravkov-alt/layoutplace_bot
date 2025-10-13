@@ -73,14 +73,17 @@ async def main():
     scheduler = setup_scheduler(lambda job_id=None: asyncio.create_task(dispatch_post(bot, job_id)))
 
     @dp.message(Command("start"))
-    async def cmd_start(m: Message):
-        await m.answer("Готов к работе.\n"
-                       "/myid — показать твой Telegram ID\n"
-                       "/post <текст> — опубликовать сразу\n"
-                       "/schedule \"Текст\" YYYY-MM-DD HH:MM [Кнопка|https://...]\n"
-                       "/queue — список запланированных\n"
-                       "/cancel <id> — отменить задачу\n"
-                       "/now — текущее время (TZ)")
+async def cmd_start(m: Message):
+    await m.answer(
+        "Готов к работе.\n"
+        "/myid – показать твой Telegram ID\n"
+        "/post <текст> – опубликовать сразу\n"
+        "/schedule \"Текст\" YYYY-MM-DD HH:MM [Кнопка|https://...]\n"
+        "/queue – список запланированных\n"
+        "/cancel <id> – отменить задачу\n"
+        "/now – текущее время (TZ)",
+        parse_mode=None
+    )
 
     @dp.message(Command("myid"))
     async def cmd_myid(m: Message):
