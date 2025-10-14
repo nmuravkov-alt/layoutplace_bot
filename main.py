@@ -19,6 +19,10 @@ from storage.db import (
     find_similar_ids,
     bulk_delete,
 )
+from storage.meta import get_meta
+import pytz
+from datetime import datetime
+
 
 # ----------------- Конфиг из переменных окружения -----------------
 
@@ -179,6 +183,24 @@ async def cmd_post_oldest(m: Message):
     except Exception as e:
         log.exception("Ошибка при чистке очереди")
         await m.answer(f"Опубликовано, но при чистке очереди случилась ошибка: <code>{e}</code>")
+        
+        @dp.message(Command("next"))
+async def cmd_next(m: Message):
+    try:
+        raw = get_meta("next_post_at")
+        if not raw:
+            await m.answer("Планировщик пока не сообщил время следующего поста.")
+            return
+        tzname = os.getenv("TZ", "Europe/Moscow")
+        tz = pytz.timezone(tzname)
+        when = datetime.fromisoformat(raw)
+        if when.tzinfo is None:
+            when = tz.localize(when)
+        show = when.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+        await m.answer(f"Следующая автопубликация: <b>{show}</b>", parse_mode="HTML")
+    except Exception as e:
+        await m.answer(f"Не смог получить время: {e}")
+
 
 # ------------- Фоллбек (чаты/группы) -------------
 
