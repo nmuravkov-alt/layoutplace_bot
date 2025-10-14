@@ -1,183 +1,174 @@
 # scheduler.py
-import os
+# Планировщик: превью админу за N минут до поста и сам пост в канал.
+
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from html import escape as html_escape
+from typing import List
 
 from aiogram import Bot
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.enums import ParseMode
 
-# DB helpers (init_db — АСИНХРОННАЯ!)
 from storage.db import (
-    init_db,          # async def
-    get_oldest,       # sync
-    delete_by_id,     # sync (резерв)
-    find_similar_ids, # sync
-    bulk_delete,      # sync
+    init_db,
+    get_oldest,
+    delete_by_id,
+    find_similar_ids,
+    bulk_delete,
 )
 
-# -------------------- ENV --------------------
+# -------------------- Конфиг --------------------
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или -100...
-ADMINS_RAW = os.getenv("ADMINS", "").strip()      # id через запятую
-TZ = os.getenv("TZ", "Europe/Moscow").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+ADMINS_RAW = os.getenv("ADMINS", "").strip()
+TZ = os.getenv("TZ", "Europe/Moscow")
 
-# Время постинга и превью (минут)
-TIMES = os.getenv("SCHEDULE_TIMES", "12,16,20")
-PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
+# Время постинга по-умолчанию — 12:00, 16:00, 20:00
+TIMES_RAW = os.getenv("POST_TIMES", "12,16,20").strip()
+# За сколько минут делать превью админу
+PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
 
-# -------------------- LOG --------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s : %(message)s")
-log = logging.getLogger("scheduler")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
-# -------------------- UTILS --------------------
-def _parse_times(times: str) -> list[int]:
-    out = []
-    for t in (times or "").split(","):
-        t = t.strip()
-        if not t:
+def _parse_admins(raw: str) -> List[int]:
+    res: List[int] = []
+    for part in raw.replace(";", ",").split(","):
+        p = part.strip()
+        if not p:
             continue
         try:
-            hour = int(t)
-            if 0 <= hour <= 23:
-                out.append(hour)
+            res.append(int(p))
         except ValueError:
             pass
-    return sorted(set(out)) or [12, 16, 20]
+    return res
 
-def _parse_admins(raw: str) -> list[int]:
-    ids = []
-    for part in (raw or "").replace(" ", "").split(","):
-        if not part:
+ADMINS: List[int] = _parse_admins(ADMINS_RAW)
+
+try:
+    tz = ZoneInfo(TZ)
+except Exception:
+    tz = ZoneInfo("UTC")
+
+def _parse_times(raw: str) -> List[datetime.time]:
+    times: List[datetime.time] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
             continue
-        if part.lstrip("-").isdigit():
-            try:
-                ids.append(int(part))
-            except ValueError:
-                pass
-    return ids
-
-def _now_tz(tz: str) -> datetime:
-    return datetime.now(ZoneInfo(tz))
-
-def _next_time(now: datetime, hours: list[int]) -> datetime:
-    """Ближайшее время из списка часов (минуты=00)."""
-    candidates = []
-    for h in hours:
-        cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
-        if cand <= now:
-            cand += timedelta(days=1)
-        candidates.append(cand)
-    return min(candidates)
-
-def _escape(text: str) -> str:
-    return html_escape(text or "")
-
-def _channel_id_value() -> int | str:
-    cid = CHANNEL_ID
-    if cid.lstrip("-").isdigit():
-        return int(cid)
-    return cid
-
-HOURS = _parse_times(TIMES)
-ADMINS = _parse_admins(ADMINS_RAW)
-CHANNEL = _channel_id_value()
-
-# -------------------- CORE --------------------
-async def send_preview_to_admins(bot: Bot, when_post: datetime, text: str):
-    """Всегда шлём превью только в личку админам."""
-    if not ADMINS:
-        log.warning("ADMINS пуст — некому отправлять превью.")
-        return
-    caption = (
-        f"🕒 ПРЕВЬЮ поста на {when_post.strftime('%Y-%m-%d %H:%M')} ({TZ})\n\n"
-        f"{_escape(text)}"
-    )
-    for uid in ADMINS:
         try:
-            await bot.send_message(uid, caption)
-        except TelegramBadRequest:
-            await bot.send_message(uid, caption)
+            hh = int(p)
+            mm = 0
+            if ":" in p:
+                hh, mm = map(int, p.split(":", 1))
+            times.append(datetime.now(tz).replace(hour=hh, minute=mm, second=0, microsecond=0).time())
+        except Exception:
+            continue
+    return times
 
-async def send_to_channel(bot: Bot, text: str):
-    """Постинг в канал: сперва HTML, при ошибке — экранированный текст."""
-    try:
-        await bot.send_message(CHANNEL, text, parse_mode=ParseMode.HTML)
-    except TelegramBadRequest:
-        await bot.send_message(CHANNEL, _escape(text))
+POST_TIMES = _parse_times(TIMES_RAW)
 
-async def do_post(bot: Bot):
-    """Берём самое старое, постим и удаляем похожие."""
-    row = get_oldest()
-    if not row:
-        log.info("Очередь пуста — постить нечего.")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("scheduler")
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+# -------------------- Планирование --------------------
+
+def _today_at(t: datetime.time) -> datetime:
+    now = datetime.now(tz)
+    return now.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+
+def _next_occurrence(target: datetime) -> datetime:
+    """Если целевое время уже прошло — переносим на завтра в то же время."""
+    now = datetime.now(tz)
+    if target <= now:
+        target = target + timedelta(days=1)
+    return target
+
+async def _send_preview(ad_id: int, text: str, when_post: datetime):
+    """Превью уходит ТОЛЬКО в личку админам."""
+    if not ADMINS:
+        log.info("Preview skipped: no ADMINS configured")
         return
-    ad_id = row["id"]
-    text = row["text"]
+    header = (
+        f"🕒 Предпросмотр поста (публикация в {when_post.strftime('%H:%M %d.%m')}, {TZ})\n"
+        f"ID в очереди: <code>{ad_id}</code>\n\n"
+    )
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(admin_id, header + text)
+        except Exception as e:
+            log.warning("Preview send failed to %s: %s", admin_id, e)
 
-    await send_to_channel(bot, text)
+async def _do_post():
+    """Постинг самого старого + чистка похожих."""
+    oldest = get_oldest()
+    if not oldest:
+        log.info("Постинг пропущен: очередь пуста")
+        return
+    ad_id, text = oldest
+    await bot.send_message(CHANNEL_ID, text)
 
-    ids = find_similar_ids(text)
-    if ad_id not in ids:
-        ids.append(ad_id)
-    deleted = bulk_delete(ids)
-    log.info("Опубликовано и удалено %s похожих (ids=%s)", deleted, ids)
+    similar = find_similar_ids(ad_id, threshold=0.88)
+    removed = bulk_delete([ad_id] + similar)
+    log.info("Опубликован %s, удалено из очереди %s (включая похожие)", ad_id, removed)
 
 async def run_scheduler():
-    if not BOT_TOKEN or not CHANNEL_ID:
-        raise RuntimeError("Не заданы BOT_TOKEN/CHANNEL_ID")
+    init_db()
+    times_info = ",".join(t.strftime("%H:%M") for t in POST_TIMES)
+    log.info("Scheduler  TZ=%s, times=%s, preview_before=%s min", TZ, times_info, PREVIEW_BEFORE_MIN)
 
-    # ВАЖНО: init_db асинхронная — обязательно await!
-    await init_db()
+    # Расчёт “окна” для превью
+    preview_delta = timedelta(minutes=PREVIEW_BEFORE_MIN)
 
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
-    log.info(
-        "Scheduler  TZ=%s, times=%s, preview_before=%s min",
-        TZ, ",".join(map(str, HOURS)), PREVIEW_MINUTES
-    )
-
-    last_preview_for: datetime | None = None
-    last_post_for: datetime | None = None
-
+    # Бесконечный цикл планировщика
     while True:
-        now = _now_tz(TZ)
-        post_at = _next_time(now, HOURS)
-        preview_at = post_at - timedelta(minutes=PREVIEW_MINUTES)
+        now = datetime.now(tz)
 
-        # превью (только админам)
-        if (last_preview_for != post_at) and (preview_at <= now < post_at):
-            row = get_oldest()
-            preview_text = row["text"] if row else "⛔ Очередь пуста"
-            await send_preview_to_admins(bot, post_at, preview_text)
-            last_preview_for = post_at
-            log.info("Превью отправлено. Пост в %s", post_at)
+        # ближайшая цель среди всех времён сегодня/завтра
+        next_posts: List[datetime] = [_next_occurrence(_today_at(t)) for t in POST_TIMES]
+        next_post = min(next_posts)
 
-        # публикация
-        if (last_post_for != post_at) and (now >= post_at):
-            await do_post(bot)
-            last_post_for = post_at
-            await asyncio.sleep(2)
+        # Если пришло время превью
+        preview_time = next_post - preview_delta
+        if preview_time <= now < next_post:
+            # отправим превью один раз в этом окне
+            # берём самый старый (только для просмотра, без удаления)
+            oldest = get_oldest()
+            if oldest:
+                ad_id, text = oldest
+                await _send_preview(ad_id, text, next_post)
+                # ждём до времени поста (чтобы не слать превью многократно)
+                sleep_sec = max(5, int((next_post - datetime.now(tz)).total_seconds()))
+                log.info("Следующий ПОСТ через %.2f минут (в %s)", sleep_sec / 60, next_post.strftime("%H:%M %d.%m"))
+                await asyncio.sleep(sleep_sec)
+                # выполнить пост
+                await _do_post()
+            else:
+                # очереди нет — просто ждём до времени поста и перепланируем
+                sleep_sec = max(5, int((next_post - now).total_seconds()))
+                log.info("Очередь пуста. Жду %s сек до следующего слота постинга", sleep_sec)
+                await asyncio.sleep(sleep_sec)
+        else:
+            # ни превью, ни пост — просто спим немного
+            # чтобы не грузить CPU, проверяем раз в 30 сек
+            await asyncio.sleep(30)
 
-        # информативный лог при старте
-        if last_preview_for is None and last_post_for is None:
-            delta_h = (preview_at - now).total_seconds() / 3600
-            log.info(
-                "Следующий ПРЕВЬЮ через %.2f часов (%s)",
-                delta_h, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z")
-            )
+# -------------------- Точка входа --------------------
 
-        await asyncio.sleep(10)
-
-def main():
-    asyncio.run(run_scheduler())
+async def main():
+    try:
+        await run_scheduler()
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
