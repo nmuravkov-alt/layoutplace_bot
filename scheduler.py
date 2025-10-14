@@ -2,101 +2,153 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from html import escape as _escape
 
 from aiogram import Bot
-from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
-from storage.db import init_db, get_oldest, find_similar_ids, bulk_delete
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-ADMINS_RAW = os.getenv("ADMINS", "").strip()
-TZ = os.getenv("TZ", "Europe/Moscow")
-POST_TIMES_RAW = os.getenv("POST_TIMES", "12:00,16:00,20:00").strip()
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+# --- БД-утилиты ---
+from storage.db import (
+    init_db,
+    get_oldest,
+    delete_by_id,
+    find_similar_ids,
+    bulk_delete,
 )
-log = logging.getLogger("scheduler")
 
-def safe_html(text: str) -> str:
-    return _escape(text, quote=False)
+# ----------------- Конфиг -----------------
+BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID  = os.getenv("CHANNEL_ID", "").strip()      # @username или -100...
+ADMINS_RAW  = os.getenv("ADMINS", "").strip()          # "123, 456 789"
+TZ_NAME     = os.getenv("TZ", "Europe/Moscow").strip()
+POST_TIMES  = os.getenv("POST_TIMES", "12,16,20").strip()  # часы через запятую
 
-ADMINS: list[int] = []
-for piece in (ADMINS_RAW or "").replace(" ", "").split(","):
-    if piece:
+def _parse_admins(raw: str) -> list[int]:
+    parts = [p.strip() for p in raw.replace(",", " ").split()]
+    out: list[int] = []
+    for p in parts:
         try:
-            ADMINS.append(int(piece))
+            out.append(int(p))
         except ValueError:
             pass
-
-def parse_times(s: str) -> list[time]:
-    out: list[time] = []
-    for part in s.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        hh, mm = part.split(":")
-        out.append(time(hour=int(hh), minute=int(mm)))
     return out
 
-def next_run_at(times: list[time], tz: ZoneInfo) -> datetime:
-    now = datetime.now(tz)
-    today_times = [datetime.combine(now.date(), t, tzinfo=tz) for t in times]
-    for dt in sorted(today_times):
-        if dt > now:
-            return dt
-    return datetime.combine(now.date() + timedelta(days=1), sorted(times)[0], tzinfo=tz)
+ADMINS: list[int] = _parse_admins(ADMINS_RAW)
+TZ = ZoneInfo(TZ_NAME)
 
-async def notify_admins(bot: Bot, text: str):
+def _parse_hours(raw: str) -> list[int]:
+    hours: list[int] = []
+    for p in raw.replace("/", ",").split(","):
+        p = p.strip()
+        if not p:
+            continue
+        try:
+            h = int(p)
+            if 0 <= h <= 23:
+                hours.append(h)
+        except ValueError:
+            continue
+    hours = sorted(set(hours))
+    return hours or [12, 16, 20]
+
+HOURS = _parse_hours(POST_TIMES)
+
+# ----------------- Логирование -----------------
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+log = logging.getLogger("scheduler")
+
+# ----------------- Хелперы -----------------
+def now() -> datetime:
+    return datetime.now(TZ)
+
+def human_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def next_run_after(dt: datetime) -> datetime:
+    """Следующее время запуска ≥ dt по списку часов HOURS."""
+    base = dt.replace(minute=0, second=0, microsecond=0)
+    today_candidates = [base.replace(hour=h) for h in HOURS]
+    for cand in today_candidates:
+        if cand >= dt:
+            return cand
+    # иначе — завтра в первый час из списка
+    return (base + timedelta(days=1)).replace(hour=HOURS[0])
+
+async def notify_admins(bot: Bot, text: str) -> None:
+    if not ADMINS:
+        return
     for uid in ADMINS:
         try:
-            await bot.send_message(uid, safe_html(text))
-        except Exception:
-            pass
+            await bot.send_message(uid, text, disable_web_page_preview=True)
+        except Exception as e:
+            log.warning(f"notify_admins fail for {uid}: {e}")
 
-async def post_once(bot: Bot):
-    ad = get_oldest()
-    if not ad:
-        await notify_admins(bot, "⛔ Очередь пуста — пост отменён.")
+async def send_to_channel(bot: Bot, text: str) -> None:
+    await bot.send_message(chat_id=CHANNEL_ID, text=text, disable_web_page_preview=True)
+
+# ----------------- Основная работа -----------------
+async def do_one_post(bot: Bot) -> None:
+    """Берём самое старое, показываем превью админам, постим, чистим похожие, шлём отчёт."""
+    await init_db()
+
+    row = await get_oldest()
+    if not row:
+        await notify_admins(bot, "⚠️ Очередь пустая — постить нечего.")
+        log.info("Очередь пустая.")
         return
-    ad_text = ad["text"]
-    await bot.send_message(CHANNEL_ID, safe_html(ad_text))
-    similar_ids = set(find_similar_ids(ad_text) or [])
-    similar_ids.add(ad["id"])
-    bulk_delete(list(similar_ids))
-    await notify_admins(bot, f"✅ Опубликовано. Удалено {len(similar_ids)} похожих.")
 
-async def run_scheduler():
-    init_db()
-    tz = ZoneInfo(TZ)
-    times = parse_times(POST_TIMES_RAW)
+    ad_id = row["id"] if isinstance(row, dict) else row[0]
+    ad_text = row["text"] if isinstance(row, dict) else row[1]
+
+    # Превью админам
+    preview = (
+        "📝 <b>Предстоящий пост</b>\n\n"
+        f"{ad_text}\n\n"
+        f"ID в очереди: <code>{ad_id}</code>"
+    )
+    await notify_admins(bot, preview)
+
+    # Пост в канал
+    await send_to_channel(bot, ad_text)
+
+    # Поиск и удаление похожих
+    similar_ids = await find_similar_ids(ad_id)  # список int (может быть пуст)
+    removed = 0
+    if similar_ids:
+        ids = set(similar_ids)
+        ids.add(ad_id)
+        removed = await bulk_delete(list(ids))
+    else:
+        await delete_by_id(ad_id)
+        removed = 1
+
+    # Итоговый отчёт
+    report = (
+        "✅ <b>Опубликовано</b>\n"
+        f"Удалено похожих (включая исходный): <b>{removed}</b>"
+    )
+    await notify_admins(bot, report)
+    log.info(f"Опубликовано и удалено {removed} записей.")
+
+async def run_scheduler() -> None:
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    log.info(f"Scheduler TZ={TZ_NAME}, times={','.join(map(str, HOURS))}")
 
+    # бесконечный цикл по расписанию
     while True:
-        run_at = next_run_at(times, tz)
-        sleep_secs = (run_at - datetime.now(tz)).total_seconds()
-        log.info(f"Следующий пост в {run_at} (через {round(sleep_secs/3600,2)} ч)")
-
-        # За 2 минуты — превью админу
-        while sleep_secs > 0:
-            if sleep_secs <= 120:
-                ad = get_oldest()
-                if ad:
-                    await notify_admins(bot, "🕒 Через 2 минуты будет опубликовано:\n\n" + ad["text"][:3900])
-                else:
-                    await notify_admins(bot, "🕒 Через 2 минуты, но очередь пуста.")
-                break
-            await asyncio.sleep(min(60, sleep_secs))
-            sleep_secs = (run_at - datetime.now(tz)).total_seconds()
-
-        await asyncio.sleep(max(0, (run_at - datetime.now(tz)).total_seconds()))
-        await post_once(bot)
+        now_dt = now()
+        run_dt = next_run_after(now_dt)
+        wait_sec = max((run_dt - now_dt).total_seconds(), 0)
+        log.info(f"Следующий пост через {wait_sec/3600:.2f} часов ({human_dt(run_dt)})")
+        try:
+            await asyncio.sleep(wait_sec)
+            await do_one_post(bot)
+        except Exception as e:
+            log.exception(f"Ошибка при выполнении поста: {e}")
+            # чтобы не улететь в быстрый цикл при постоянной ошибке
+            await asyncio.sleep(10)
 
 async def main():
     await run_scheduler()
@@ -105,4 +157,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
+        log.info("Scheduler stopped")
