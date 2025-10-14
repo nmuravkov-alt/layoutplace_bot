@@ -33,7 +33,7 @@ def _normalize(text: str) -> str:
 def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(a=a, b=b).ratio()
 
-async def init_db():... -> return None:
+async def init_db():
     with _cx() as cx:
         cx.execute(
             """
@@ -43,6 +43,11 @@ async def init_db():... -> return None:
                 norm TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             )
+            """
+        )
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_created ON ads(created_at)")
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_norm ON ads(norm)")
+
             """
         )
         cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_created ON ads(created_at)")
