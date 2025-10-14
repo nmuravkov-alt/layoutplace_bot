@@ -1,154 +1,310 @@
 # scheduler.py
-# Планировщик: 3 раза в день триггерит /post_oldest и уведомляет админа
-
+import os
 import asyncio
 import logging
-import os
 from datetime import datetime, time, timedelta
-from typing import List
 
 import pytz
 from aiogram import Bot
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import InputMediaPhoto
 
-# опционально: храним «когда следующий пост» в мета
-try:
-    from storage.meta import set_meta  # type: ignore
-except Exception:
-    def set_meta(*_args, **_kwargs):
-        pass
+# ---------- Импорт из вашей БД ----------
+from storage.db import (
+    init_db,
+    get_oldest,
+    delete_by_id,
+    find_similar_ids,
+    bulk_delete,
+)
 
-
-# ------------ Конфиг из ENV ------------
-
+# ---------- ENV / Конфиг ----------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMINS_RAW = os.getenv("ADMINS", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или numeric id
 TZ_NAME = os.getenv("TZ", "Europe/Moscow").strip()
-SCHEDULE_TIMES = os.getenv("SCHEDULE_TIMES", "12:00,16:00,20:00").strip()
 
-# берём первого админа как основной чат для уведомлений/триггера команды
-ADMIN_ID = None
-for chunk in ADMINS_RAW.split(","):
-    s = chunk.strip()
-    if s.isdigit():
-        ADMIN_ID = int(s)
-        break
+# Времена автопостинга (локальные для TZ_NAME). Формат: "12:00,16:00,20:00"
+TIMES_RAW = os.getenv("TIMES", "12:00,16:00,20:00")
+SLOT_TIMES: list[time] = []
+for part in TIMES_RAW.replace(" ", "").split(","):
+    try:
+        hh, mm = part.split(":")
+        SLOT_TIMES.append(time(int(hh), int(mm)))
+    except Exception:
+        pass
+if not SLOT_TIMES:
+    SLOT_TIMES = [time(12, 0), time(16, 0), time(20, 0)]
 
-
-# ------------ Вспомогалки ------------
-
-def parse_times(spec: str) -> List[time]:
-    """Парсим 'HH:MM,HH:MM,...' → [time, ...]"""
-    out: List[time] = []
-    for part in spec.split(","):
-        p = part.strip()
-        if not p:
+# Админы (user_id через запятую)
+ADMINS_RAW = os.getenv("ADMINS", "").strip()
+ADMINS: list[int] = []
+if ADMINS_RAW:
+    for chunk in ADMINS_RAW.replace(" ", "").split(","):
+        if not chunk:
             continue
         try:
-            hh, mm = p.split(":")
-            out.append(time(int(hh), int(mm)))
-        except Exception:
-            logging.warning(f"Skip bad time '{p}' in SCHEDULE_TIMES")
-    if not out:
-        out = [time(12, 0), time(16, 0), time(20, 0)]
-    return sorted(out)
+            ADMINS.append(int(chunk))
+        except ValueError:
+            # если вдруг передали @username — пропустим
+            pass
+
+# За сколько минут до поста слать превью
+PREVIEW_MIN = int(os.getenv("PREVIEW_MIN", "10"))
+
+# Логгер
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("scheduler")
+
+# TZ
+try:
+    tz = pytz.timezone(TZ_NAME)
+except Exception:
+    tz = pytz.timezone("Europe/Moscow")
 
 
-def next_run_dt(now: datetime, times: List[time], tz) -> datetime:
-    """Находим ближайшее время запуска c учётом TZ."""
-    today = now.date()
-    # сперва сегодня
-    for t in times:
-        candidate = tz.localize(datetime.combine(today, t))
-        if candidate > now:
-            return candidate
-    # иначе завтра первое время
+# ---------- Утилиты построения поста ----------
+def _extract_media_urls(item) -> list[str]:
+    """
+    Пытаемся вытащить список URL фото из записи БД.
+    Поддерживаем несколько возможных ключей.
+    """
+    candidates = []
+    # частые варианты ключей
+    for k in ("media", "photos", "images", "pics"):
+        v = item.get(k) if isinstance(item, dict) else None
+        if v:
+            if isinstance(v, list):
+                candidates = [str(x) for x in v if x]
+            elif isinstance(v, str):
+                # возможно строка с запятыми
+                pieces = [p.strip() for p in v.split(",") if p.strip()]
+                candidates = pieces
+            break
+    return candidates
+
+
+def _extract_text(item) -> str:
+    """
+    Пытаемся вытащить текст объявления.
+    """
+    # частые варианты ключей
+    for k in ("text", "caption", "body", "content"):
+        if isinstance(item, dict) and k in item and item[k]:
+            return str(item[k])
+    # если item — не dict, пробуем как есть
+    if isinstance(item, str):
+        return item
+    return ""
+
+
+def build_caption_and_media(item):
+    """
+    Возвращает:
+      caption: str
+      media_list: list[InputMediaPhoto] или []
+      first_photo_url: str | None
+    """
+    caption = _extract_text(item).strip()
+    urls = _extract_media_urls(item)
+
+    media_list: list[InputMediaPhoto] = []
+    first_photo_url = urls[0] if urls else None
+
+    if urls:
+        # если несколько фото — готовим медиагруппу
+        for i, url in enumerate(urls):
+            if i == 0:
+                # подпись ставим на первый элемент (Telegram покажет её под альбомом)
+                media_list.append(InputMediaPhoto(media=url, caption=caption or None, parse_mode="HTML"))
+            else:
+                media_list.append(InputMediaPhoto(media=url))
+    # если фото нет — media_list будет пустой, значит отправим просто текст
+    return caption, media_list, first_photo_url
+
+
+# ---------- Уведомления админам ----------
+async def notify_admins_preview(bot: Bot, when_dt: datetime, caption: str, first_photo: str | None):
+    if not ADMINS:
+        return
+    header = f"🕒 Через {PREVIEW_MIN} мин. автопост ({when_dt:%Y-%m-%d %H:%M} {when_dt.tzname()})\n\n"
+    text = header + (caption or "— без текста —")
+    for admin_id in ADMINS:
+        try:
+            if first_photo:
+                # Пытаемся прислать фото + подпись
+                await bot.send_photo(admin_id, first_photo, caption=text, parse_mode="HTML", disable_notification=True)
+            else:
+                await bot.send_message(admin_id, text, parse_mode="HTML", disable_web_page_preview=True, disable_notification=True)
+        except Exception as e:
+            log.warning(f"preview to admin {admin_id} failed: {e}")
+
+
+async def notify_admins_published_copy(bot: Bot, channel_id, sent_result):
+    """
+    Копируем опубликованный пост админам.
+    Если альбом — копируем первый элемент (с подписью).
+    """
+    if not ADMINS:
+        return
+
+    # sent_result может быть list[Message] (media_group) или Message
+    if isinstance(sent_result, list) and sent_result:
+        msg_id = sent_result[0].message_id
+    else:
+        msg_id = getattr(sent_result, "message_id", None)
+
+    if not msg_id:
+        return
+
+    for admin_id in ADMINS:
+        try:
+            await bot.copy_message(chat_id=admin_id, from_chat_id=CHANNEL_ID, message_id=msg_id)
+        except Exception as e:
+            log.warning(f"copy to admin {admin_id} failed: {e}")
+
+
+# ---------- Время и слоты ----------
+def next_slot(now_dt: datetime) -> datetime:
+    """
+    Возвращает ближайший datetime публикации в TZ tz.
+    """
+    # кандидаты сегодня
+    today = now_dt.date()
+    candidates = [tz.localize(datetime.combine(today, t)) for t in SLOT_TIMES]
+    for dtc in candidates:
+        if dtc > now_dt:
+            return dtc
+    # иначе — первый слот завтрашнего дня
     tomorrow = today + timedelta(days=1)
-    return tz.localize(datetime.combine(tomorrow, times[0]))
+    return tz.localize(datetime.combine(tomorrow, SLOT_TIMES[0]))
 
 
-async def notify_admin(bot: Bot, text: str):
-    """Тихо уведомляем админа (если задан)."""
-    if not (ADMIN_ID and isinstance(ADMIN_ID, int)):
-        return
-    try:
-        await bot.send_message(ADMIN_ID, text, disable_web_page_preview=True)
-    except Exception as e:
-        logging.warning(f"notify_admin failed: {e}")
-
-
-async def trigger_post(bot: Bot):
+# ---------- Публикация ----------
+async def publish_item(bot: Bot, item) -> object | list[object] | None:
     """
-    Триггерим публикацию через основной бот:
-    посылаем админу команду /post_oldest — дальше обработчик в main.py всё сделает.
+    Публикует запись в канал.
+    Возвращает объект(ы) Message, пригодные для copy_message.
     """
-    if not (ADMIN_ID and isinstance(ADMIN_ID, int)):
-        logging.error("ADMIN_ID is not set; cannot trigger /post_oldest")
-        return
+    caption, media, _ = build_caption_and_media(item)
+
+    # если есть 2+ фото — публикуем альбом
+    if len(media) >= 2:
+        try:
+            sent = await bot.send_media_group(CHANNEL_ID, media=media)
+            return sent
+        except Exception as e:
+            log.warning(f"send_media_group failed: {e}")
+
+    # если одно фото — send_photo
+    if len(media) == 1:
+        try:
+            sent = await bot.send_photo(CHANNEL_ID, media[0].media, caption=caption or None, parse_mode="HTML")
+            return sent
+        except Exception as e:
+            log.warning(f"send_photo failed: {e}")
+
+    # иначе — просто текст
     try:
-        await bot.send_message(ADMIN_ID, "/post_oldest")
+        sent = await bot.send_message(CHANNEL_ID, caption or " ", parse_mode="HTML", disable_web_page_preview=False)
+        return sent
     except Exception as e:
-        logging.exception(f"Failed to trigger /post_oldest: {e}")
+        log.error(f"send_message failed: {e}")
+        return None
 
 
-# ------------ Основной цикл планировщика ------------
-
+# ---------- Основной цикл ----------
 async def run_scheduler():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is empty")
-    if ADMIN_ID is None:
-        logging.warning("ADMINS is empty or invalid — уведомления и триггер /post_oldest не будут работать")
+    if not BOT_TOKEN or not CHANNEL_ID:
+        raise RuntimeError("BOT_TOKEN / CHANNEL_ID не заданы")
 
-    tz = pytz.timezone(TZ_NAME or "Europe/Moscow")
-    times = parse_times(SCHEDULE_TIMES)
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 
-    logging.info(f"Scheduler TZ={tz.zone}, times={','.join(t.strftime('%H:%M') for t in times)}")
+    # гарантируем, что таблицы БД созданы
+    await init_db()
 
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Лог конфигурации
+    log.info(f"Scheduler TZ={TZ_NAME}, times={','.join([t.strftime('%H:%M') for t in SLOT_TIMES])}")
 
-    try:
-        while True:
-            now = datetime.now(tz)
-            nxt = next_run_dt(now, times, tz)
+    while True:
+        now_dt = datetime.now(tz)
+        post_dt = next_slot(now_dt)
+        eta_sec = (post_dt - now_dt).total_seconds()
+        log.info(f"Следующий пост через {eta_sec/3600:.2f} часов ({post_dt:%Y-%m-%d %H:%M %Z})")
 
-            # сохраним в мета и уведомим
-            try:
-                set_meta("next_post_at", nxt.isoformat())
-            except Exception:
-                pass
+        # ---- PREVIEW ----
+        # если есть время на превью — подсмотрим самого «кандидата» и отправим админам
+        if eta_sec > PREVIEW_MIN * 60:
+            peek = await get_oldest()
+            if peek:
+                cap, media_list, first_photo = build_caption_and_media(peek)
+                try:
+                    await notify_admins_preview(bot, post_dt, cap, first_photo)
+                except Exception as e:
+                    log.warning(f"notify preview failed: {e}")
+            else:
+                # очередь пуста — предупредим админов
+                for admin_id in ADMINS:
+                    try:
+                        await bot.send_message(admin_id, f"ℹ️ Очередь пуста — публикация в {post_dt:%H:%M} пропустится.")
+                    except Exception:
+                        pass
+            # Спим до момента постинга, минус «остаток» уже потратили на превью.
+            await asyncio.sleep(eta_sec - PREVIEW_MIN * 60)
+        else:
+            # Прямо спим до слота
+            await asyncio.sleep(max(0, eta_sec))
 
-            hours_left = (nxt - now).total_seconds() / 3600.0
-            logging.info(f"Следующий пост через {hours_left:.2f} часов ({nxt.strftime('%Y-%m-%d %H:%M:%S %Z')})")
-            await notify_admin(
-                bot,
-                f"🗓 Следующий пост в <b>{nxt.strftime('%Y-%m-%d %H:%M:%S %Z')}</b>\n"
-                f"(через ~{hours_left:.2f} ч)"
-            )
+        # ---- ПУБЛИКАЦИЯ ----
+        try:
+            item = await get_oldest()
+            if not item:
+                log.info("Очередь пуста — нечего публиковать.")
+                continue
 
-            # спим до времени публикации
-            await asyncio.sleep(max(1, int((nxt - datetime.now(tz)).total_seconds())))
+            # Публикация
+            sent = await publish_item(bot, item)
+            if sent:
+                # Скопировать опубликованное админам
+                try:
+                    await notify_admins_published_copy(bot, CHANNEL_ID, sent)
+                except Exception as e:
+                    log.warning(f"notify copy failed: {e}")
 
-            # попытка публикации
-            try:
-                await trigger_post(bot)
-                await notify_admin(bot, "✅ Запрос на публикацию отправлен (/post_oldest).")
-            except Exception as e:
-                logging.exception(f"Post failed: {e}")
-                await notify_admin(bot, f"❌ Ошибка публикации: <code>{e}</code>")
+                # Удалить текущий элемент (опубликованный)
+                try:
+                    # id пытаемся достать максимально совместимо
+                    item_id = None
+                    if isinstance(item, dict):
+                        for k in ("id", "_id", "rowid"):
+                            if k in item:
+                                item_id = item[k]
+                                break
+                    if item_id is not None:
+                        await delete_by_id(item_id)
+                except Exception as e:
+                    log.warning(f"delete current failed: {e}")
 
-            await asyncio.sleep(2)
-    finally:
-        await bot.session.close()
+                # Удалить похожие
+                try:
+                    similar_ids = await find_similar_ids(item)
+                    if similar_ids:
+                        await bulk_delete(similar_ids)
+                except Exception as e:
+                    log.warning(f"bulk_delete similar failed: {e}")
+            else:
+                log.error("Не удалось опубликовать пост.")
+        except Exception as e:
+            log.exception(f"Публикация упала: {e}")
+            # ждём минуту чтобы не «крутиться» в ошибке
+            await asyncio.sleep(60)
 
 
-def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-    asyncio.run(run_scheduler())
+async def main():
+    await run_scheduler()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
