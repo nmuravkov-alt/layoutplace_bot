@@ -2,16 +2,15 @@
 import asyncio
 import logging
 import os
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from html import escape as _escape
+from datetime import datetime, timezone
+from typing import List
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
 from storage.db import (
     init_db,
@@ -20,148 +19,165 @@ from storage.db import (
     delete_by_id,
     find_similar_ids,
     bulk_delete,
+    plan_cancel,
+    plan_get,
 )
 
-# -------------------- Настройки окружения --------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("layoutplace_bot")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-ADMINS_RAW = os.getenv("ADMINS", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или -100...
+ADMINS_RAW = os.getenv("ADMINS", "").strip()      # id через запятую
 TZ = os.getenv("TZ", "Europe/Moscow")
 
 if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN не задан!")
-if not CHANNEL_ID:
-    raise RuntimeError("❌ CHANNEL_ID не задан!")
+    raise RuntimeError("BOT_TOKEN is empty")
 
-ADMINS: set[int] = set()
-for piece in (ADMINS_RAW or "").replace(" ", "").split(","):
-    if piece:
+def _parse_admins(raw: str) -> List[int]:
+    ids: List[int] = []
+    for p in (raw or "").replace(";", ",").split(","):
+        p = p.strip()
+        if not p:
+            continue
         try:
-            ADMINS.add(int(piece))
+            ids.append(int(p))
         except ValueError:
             pass
+    return ids
 
-# -------------------- Настройка логов --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("layoutplace_bot")
+ADMINS = _parse_admins(ADMINS_RAW)
 
-# -------------------- Вспомогательные функции --------------------
-def safe_html(text: str) -> str:
-    """Экранирует HTML, чтобы Telegram не ругался на < >"""
-    return _escape(text, quote=False)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
-def now_str() -> str:
-    tz = ZoneInfo(TZ)
-    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+# ------------------------ утилиты ------------------------
 
-def is_admin(m: Message) -> bool:
-    return m.from_user and m.from_user.id in ADMINS
-
-async def send_to_channel(bot: Bot, text: str):
-    await bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=safe_html(text),
-        disable_web_page_preview=False,
-    )
-
-def _ad_fields(ad) -> tuple[int, str]:
-    if ad is None:
-        return (0, "")
-    if isinstance(ad, dict):
-        return int(ad.get("id", 0)), str(ad.get("text", ""))
+def _now_str() -> str:
     try:
-        return int(ad[0]), str(ad[1])
+        import pytz, datetime as _dt
+        tz = pytz.timezone(TZ)
+        return _dt.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
-        return (0, "")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-async def post_oldest_and_cleanup(bot: Bot, reply_to: Message | None = None):
-    ad = get_oldest()
-    ad_id, ad_text = _ad_fields(ad)
-    if not ad_id or not ad_text.strip():
-        msg = "Очередь пуста — нечего постить."
-        if reply_to:
-            await reply_to.answer(msg)
-        else:
-            log.info(msg)
-        return
+async def _send_to_admins(text: str, reply_markup=None):
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("send admin %s failed: %s", admin_id, e)
 
-    await send_to_channel(bot, ad_text)
-    similar_ids = set(find_similar_ids(ad_text) or [])
-    similar_ids.add(ad_id)
-    bulk_delete(list(similar_ids))
+async def _send_to_channel(text: str):
+    await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=False)
 
-    msg = f"✅ Опубликовано и удалено {len(similar_ids)} объявлений."
-    if reply_to:
-        await reply_to.answer(msg)
-    else:
-        log.info(msg)
+# ------------------------ команды ------------------------
 
-# -------------------- Основной запуск --------------------
-async def main():
-    init_db()
-
-    bot = Bot(
-        BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    help_text = (
+        "Готов к работе.\n\n"
+        "<b>Команды</b>:\n"
+        "/myid — показать твой Telegram ID\n"
+        "/enqueue <текст> — положить объявление в очередь\n"
+        "/queue — показать размер очереди\n"
+        "/post_oldest — опубликовать самое старое и удалить похожие\n"
+        "/now — текущее время сервера\n"
+        "/plans — показать запланированные (для отладки)\n"
     )
-    dp = Dispatcher(storage=MemoryStorage())
+    await m.answer(help_text)
 
-    @dp.message(Command("start"))
-    async def cmd_start(m: Message):
-        text = (
-            "✅ Готов к работе.\n\n"
-            "<b>Команды:</b>\n"
-            "/myid — показать твой Telegram ID\n"
-            "/enqueue <текст> — добавить объявление в очередь\n"
-            "/post_oldest — опубликовать самое старое объявление\n"
-            "/queue — показать количество объявлений в базе\n"
-            "/now — текущее время сервера\n"
-        )
-        await m.answer(text)
+@dp.message(Command("myid"))
+async def cmd_myid(m: Message):
+    await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
 
-    @dp.message(Command("myid"))
-    async def cmd_myid(m: Message):
-        await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
+def _is_admin(uid: int) -> bool:
+    return uid in ADMINS
 
-    @dp.message(Command("now"))
-    async def cmd_now(m: Message):
-        await m.answer(f"🕒 Серверное время: <b>{now_str()}</b>")
+@dp.message(Command("now"))
+async def cmd_now(m: Message):
+    await m.answer(f"Серверное время: <b>{_now_str()}</b>")
 
-    @dp.message(Command("enqueue"))
-    async def cmd_enqueue(m: Message, command: CommandObject):
-        if not is_admin(m):
-            return await m.answer("⛔ Нет прав.")
+@dp.message(Command("enqueue"))
+async def cmd_enqueue(m: Message, command: CommandObject):
+    if not _is_admin(m.from_user.id):
+        return await m.answer("Нет прав.")
+    text = (command.args or "").strip()
+    if not text:
+        return await m.answer("Использование:\n/enqueue <текст объявления>")
+    import time
+    ad_id = db_enqueue(text, int(time.time()))
+    await m.answer(f"Добавлено в очередь (id={ad_id}).")
 
-        text = (command.args or "").strip()
-        if not text:
-            return await m.answer("Используй: /enqueue ТЕКСТ_ОБЪЯВЛЕНИЯ")
+@dp.message(Command("queue"))
+async def cmd_queue(m: Message):
+    # просто считаем приблизительно
+    from storage.db import _cx
+    with _cx() as cx:
+        cnt = cx.execute("SELECT COUNT(*) FROM ads").fetchone()[0]
+    await m.answer(f"В очереди объявлений: <b>{cnt}</b>")
 
-        db_enqueue(text)
-        await m.answer("✅ Добавлено в очередь.")
+@dp.message(Command("post_oldest"))
+async def cmd_post_oldest(m: Message):
+    if not _is_admin(m.from_user.id):
+        return await m.answer("Нет прав.")
+    ad = get_oldest()
+    if not ad:
+        return await m.answer("Очередь пуста.")
+    ad_id, text = ad
+    await _send_to_channel(text)
+    # удаляем сам пост и похожие
+    sims = find_similar_ids(ad_id)
+    delete_by_id(ad_id)
+    bulk_delete(sims)
+    await m.answer(f"Опубликовано.\nУдалено похожих: {len(sims)}")
 
-    @dp.message(Command("post_oldest"))
-    async def cmd_post_oldest(m: Message):
-        if not is_admin(m):
-            return await m.answer("⛔ Нет прав.")
-        await post_oldest_and_cleanup(bot, reply_to=m)
+@dp.message(Command("plans"))
+async def cmd_plans(m: Message):
+    if not _is_admin(m.from_user.id):
+        return await m.answer("Нет прав.")
+    from storage.db import _cx
+    with _cx() as cx:
+        rows = cx.execute(
+            "SELECT token, ad_id, run_at, status FROM planned ORDER BY run_at ASC LIMIT 10"
+        ).fetchall()
+    if not rows:
+        return await m.answer("Запланированных записей нет.")
+    import datetime as _dt
+    items = []
+    for token, ad_id, run_at, status in rows:
+        when = datetime.fromtimestamp(run_at).strftime("%Y-%m-%d %H:%M:%S")
+        items.append(f"• <code>{token}</code> — ad:{ad_id} — {when} — <b>{status}</b>")
+    await m.answer("\n".join(items))
 
-    @dp.message(Command("queue"))
-    async def cmd_queue(m: Message):
-        if not is_admin(m):
-            return await m.answer("⛔ Нет прав.")
-        from storage.db import _cx
-        with _cx() as cx:
-            count = cx.execute("SELECT COUNT(*) FROM ads").fetchone()[0]
-        await m.answer(f"📦 Сейчас в очереди: <b>{count}</b> объявлений.")
+# ------------------------ callback: отмена превью ------------------------
 
-    log.info(f"✅ Бот запущен для {CHANNEL_ID} (TZ={TZ})")
+@dp.callback_query(F.data.startswith("cancel:"))
+async def cb_cancel(q: CallbackQuery):
+    if not _is_admin(q.from_user.id):
+        return await q.answer("Нет прав", show_alert=True)
+
+    token = q.data.split(":", 1)[1]
+    ok = plan_cancel(token)
+    plan = plan_get(token)
+    if ok:
+        await q.answer("Пост отменён")
+        await q.message.edit_reply_markup(reply_markup=None)
+        if plan:
+            await _send_to_admins(
+                f"❌ Отменён пост по превью.\n"
+                f"token: <code>{token}</code>\n"
+                f"ad_id: <b>{plan['ad_id']}</b>\n"
+            )
+    else:
+        await q.answer("Не удалось отменить (возможно, уже отменён/не найден)", show_alert=True)
+
+# ------------------------ run ------------------------
+
+async def main():
+    await init_db()
+    log.info("Бот запущен для %s (TZ %s)", CHANNEL_ID, TZ)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    asyncio.run(main())
