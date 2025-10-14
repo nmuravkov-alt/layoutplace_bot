@@ -64,63 +64,47 @@ async def _notify_admins(bot: Bot, text: str):
 # ---------------- форматирование подписи ----------------
 def unify_caption(text: str | None) -> str:
     text = (text or "").strip()
-
-    # простые правки
     text = text.replace("Цена -", "Цена —").replace("Цена — ", "Цена — ")
-    text = text.replace("Размер:", "Размер:").replace("Состояние :", "Состояние :").replace("Состояние:", "Состояние :")
-    # убираем двойные пробелы и пустые строки
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     text = "\n".join(lines)
-
-    # добавим «Общие» ссылки, если их нет
     if "layoutplacebuy" not in text:
         text += "\n\n@layoutplacebuy"
-    if "#штаны" in text or "#куртки" in text or "#аксессуары" in text:
-        # ок — теги уже есть
-        pass
-
     return text
 
 # --------------- копирование поста и удаление оригинала ---------------
-async def copy_and_delete(bot: Bot, source_chat_id: int, message_ids: list[int], target: str | int, caption_override: str | None):
-    # Копируем пачкой по одному сообщению
+async def copy_and_delete(bot: Bot, source_chat_id: int | str, message_ids: list[int], target: str | int, caption_override: str | None):
     posted_message_ids: list[int] = []
     caption = unify_caption(caption_override)
     for idx, mid in enumerate(message_ids):
-        try:
-            if idx == 0 and caption:
-                msg = await bot.copy_message(
-                    chat_id=target,
-                    from_chat_id=source_chat_id,
-                    message_id=mid,
-                    caption=caption,
-                    parse_mode=ParseMode.HTML
-                )
-            else:
-                msg = await bot.copy_message(
-                    chat_id=target,
-                    from_chat_id=source_chat_id,
-                    message_id=mid
-                )
-            posted_message_ids.append(msg.message_id)
-        except Exception as e:
-            log.exception("Ошибка копирования message_id=%s: %s", mid, e)
-            raise
+        if idx == 0 and caption:
+            msg = await bot.copy_message(
+                chat_id=target,
+                from_chat_id=source_chat_id,
+                message_id=mid,
+                caption=caption,
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            msg = await bot.copy_message(
+                chat_id=target,
+                from_chat_id=source_chat_id,
+                message_id=mid
+            )
+        posted_message_ids.append(msg.message_id)
 
     # Удаляем оригиналы (если у бота есть права)
     for mid in message_ids:
         try:
             await bot.delete_message(chat_id=source_chat_id, message_id=mid)
         except Exception:
-            # не критично — бывает нет прав на удаление старых сообщений
             pass
 
     return posted_message_ids
 
 # ---------------- основной цикл ----------------
 async def run_scheduler():
-    props = DefaultBotProperties(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    # ВАЖНО: здесь нельзя указывать disable_web_page_preview — его нет в DefaultBotProperties
+    props = DefaultBotProperties(parse_mode=ParseMode.HTML)
     bot = Bot(BOT_TOKEN, default=props)
 
     await _notify_admins(bot, f"🕒 Планировщик запущен.\nСлоты: <code>{TIMES_RAW}</code>\nПревью: <b>{PREVIEW_BEFORE_MIN}</b> мин.\nОчередь: <b>{queue_count_pending()}</b>")
@@ -128,10 +112,8 @@ async def run_scheduler():
     while True:
         now = _utcnow()
         next_slot = _next_run(now, TIMES)
-        # момент превью
         preview_at = next_slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
         if preview_at < now:
-            # если «опоздали» — превью сразу
             preview_at = now + timedelta(seconds=5)
 
         # Ждём превью
@@ -140,7 +122,6 @@ async def run_scheduler():
 
         row = queue_next_pending()
         if row:
-            # превью админу
             preview_text = (
                 f"👀 Предпросмотр на {next_slot.strftime('%H:%M')}:\n"
                 f"<i>источник</i>: <code>{row['source_chat_id']}</code>\n"
@@ -151,7 +132,7 @@ async def run_scheduler():
         else:
             await _notify_admins(bot, "ℹ️ Очередь пуста — публиковать нечего.")
 
-        # Ждём сам слот
+        # Ждём слот
         delay_post = max(0.0, (next_slot - _utcnow()).total_seconds())
         await asyncio.sleep(delay_post)
 
@@ -161,6 +142,7 @@ async def run_scheduler():
             log.info("Слот %s: очередь пуста", next_slot)
             continue
 
+        # message_ids может быть в JSON/строке
         try:
             message_ids = [int(x) for x in eval(row["message_ids"])]
         except Exception:
@@ -170,7 +152,7 @@ async def run_scheduler():
         try:
             await copy_and_delete(
                 bot=bot,
-                source_chat_id=int(row["source_chat_id"]),
+                source_chat_id=row["source_chat_id"],
                 message_ids=message_ids,
                 target=CHANNEL_ID,
                 caption_override=row.get("caption_override")
