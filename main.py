@@ -3,15 +3,14 @@ import asyncio
 import logging
 import os
 from datetime import datetime
-import re
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatType
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
 
 from storage.db import (
     init_db,
@@ -22,53 +21,71 @@ from storage.db import (
     bulk_delete,
 )
 
-# ==================== Конфиг из переменных окружения ====================
+# -------------------- Конфиг из окружения --------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-ADMINS_RAW = os.getenv("ADMINS", "").strip()  # id через запятую
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()   # @username канала или -100...
+ADMINS_RAW = os.getenv("ADMINS", "").strip()       # список id через запятую
 TZ = os.getenv("TZ", "Europe/Moscow")
 
-# ==================== Логирование ====================
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+try:
+    tz = ZoneInfo(TZ)
+except Exception:
+    tz = ZoneInfo("UTC")
 
-# ==================== Инициализация ====================
+def _parse_admins(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            ids.add(int(p))
+        except ValueError:
+            pass
+    return ids
 
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+ADMINS: set[int] = _parse_admins(ADMINS_RAW)
+
+def now_str() -> str:
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+# -------------------- Инициализация бота ---------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+log = logging.getLogger("layoutplace_bot")
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ==================== Безопасная отправка ====================
+# -------------------- Хелперы -------------------------------
 
-ALLOWED_TAGS = {"b", "strong", "i", "em", "u", "s", "strike", "del", "tg-spoiler", "a", "code", "pre"}
+def is_admin(message: Message) -> bool:
+    uid = message.from_user.id if message.from_user else 0
+    return uid in ADMINS
 
-def clean_html_tags(text: str) -> str:
-    """Удаляет теги, не разрешённые Telegram."""
-    def repl(m):
-        tag = m.group(1).lower()
-        if tag in ALLOWED_TAGS or tag.startswith("a "):
-            return m.group(0)
-        return ""
-    return re.sub(r"</?([^ >/]+)[^>]*>", repl, text)
+async def send_to_channel(text: str) -> None:
+    """Пост в канал."""
+    await bot.send_message(CHANNEL_ID, text)
 
-async def safe_send(bot, chat_id, text, **kwargs):
-    """Безопасно отправляет сообщение — чистит HTML и ловит TelegramBadRequest."""
-    text = clean_html_tags(text)
-    try:
-        await bot.send_message(chat_id, text, **kwargs)
-    except TelegramBadRequest:
-        await bot.send_message(chat_id, text, parse_mode=None)
-
-# ==================== Команды ====================
+# -------------------- Команды -------------------------------
 
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
     help_text = (
         "Готов к работе.\n\n"
-        "<b>Команды:</b>\n"
+        "<b>Команды</b>:\n"
         "/myid — показать твой Telegram ID\n"
-        "/enqueue &lt;текст&gt; — положить объявление в очередь\n"
+        "/enqueue текст — положить объявление в очередь\n"
         "/queue — показать размер очереди\n"
         "/post_oldest — опубликовать самое старое и удалить похожие\n"
         "/now — текущее время сервера\n"
@@ -81,40 +98,62 @@ async def cmd_myid(m: Message):
 
 @dp.message(Command("now"))
 async def cmd_now(m: Message):
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    await m.answer(f"<b>Серверное время:</b> {now_str}")
+    await m.answer(f"<b>Серверное время:</b> {now_str()} ({TZ})")
 
 @dp.message(Command("enqueue"))
 async def cmd_enqueue(m: Message, command: CommandObject):
-    if not command.args:
-        await m.answer("❗ Введи текст объявления: /enqueue <текст>")
+    if not is_admin(m):
+        await m.answer("Нет прав.")
         return
-    text = command.args.strip()
-    db_enqueue(text)
-    await m.answer("✅ Объявление добавлено в очередь")
+    # Берём текст после команды
+    # примеры: "/enqueue Текст..." или "/enqueue\nТекст..."
+    text_after = m.text.split(maxsplit=1)
+    text = text_after[1].strip() if len(text_after) > 1 else ""
+    if not text:
+        await m.answer("Нужно передать текст объявления. Пример:\n/enqueue Джинсы L, 3500 ₽ #штаны")
+        return
+
+    ad_id = db_enqueue(text)
+    await m.answer(f"OK, объявление добавлено в очередь. ID: <code>{ad_id}</code>")
 
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
-    count = get_oldest(count_only=True)
-    await m.answer(f"📊 В очереди {count} объявлений")
+    if not is_admin(m):
+        await m.answer("Нет прав.")
+        return
+    count = get_oldest(count_only=True)  # благодаря обновлённому db.py
+    await m.answer(f"В очереди: <b>{count}</b>.")
 
 @dp.message(Command("post_oldest"))
 async def cmd_post_oldest(m: Message):
-    ad = get_oldest()
-    if not ad:
-        await m.answer("❗ Очередь пуста")
+    if not is_admin(m):
+        await m.answer("Нет прав.")
         return
-    text, ad_id = ad["text"], ad["id"]
-    await safe_send(bot, CHANNEL_ID, text)
-    delete_by_id(ad_id)
-    await m.answer("✅ Опубликовано и удалено самое старое объявление")
 
-# ==================== Запуск ====================
+    oldest = get_oldest()
+    if not oldest:
+        await m.answer("Очередь пуста.")
+        return
+
+    ad_id, text = oldest
+    # Постим в канал
+    await send_to_channel(text)
+
+    # Удаляем похожие + сам пост
+    similar = find_similar_ids(ad_id, threshold=0.88)
+    removed = bulk_delete([ad_id] + similar)
+
+    await m.answer(
+        f"Опубликовано объявление <code>{ad_id}</code> в канал.\n"
+        f"Удалено из очереди объявлений: <b>{removed}</b> (включая похожие)."
+    )
+
+# -------------------- Точка входа ----------------------------
 
 async def main():
-    await init_db()
-    logger.info("✅ Бот запущен для @layoutplace (TZ=%s)", TZ)
-    await dp.start_polling(bot)
+    init_db()
+    log.info("✅ Бот запущен для @%s (TZ=%s)", CHANNEL_ID.strip("@"), TZ)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
     asyncio.run(main())
