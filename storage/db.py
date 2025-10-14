@@ -33,7 +33,7 @@ def _normalize(text: str) -> str:
 def _similar(a: str, b: str) -> float:
     return difflib.SequenceMatcher(a=a, b=b).ratio()
 
-def init_db() -> None:
+async def init_db():... -> return None:
     with _cx() as cx:
         cx.execute(
             """
