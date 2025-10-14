@@ -1,4 +1,7 @@
 # scheduler.py
+# 1) Регулярные слоты (напр. 12:00,16:00,20:00) с превью за N минут и кнопкой «Опубликовать сейчас»
+# 2) Разовые job'ы из /post_at HH:MM (храним ad_id и время), с превью за N минут
+
 import asyncio
 import logging
 import os
@@ -17,6 +20,9 @@ from storage.db import (
     get_oldest,
     find_similar_ids,
     bulk_delete,
+    job_get_next,
+    job_mark_preview_sent,
+    job_delete,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -28,7 +34,6 @@ PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
 POST_REPORT_TO_CHANNEL = os.getenv("POST_REPORT_TO_CHANNEL", "0").strip() == "1"
 
 tz = ZoneInfo(TZ)
-
 ADMINS = []
 for p in ADMINS_RAW.replace(";", ",").split(","):
     p = p.strip()
@@ -59,7 +64,7 @@ def _today_at(hh: int, mm: int) -> datetime:
     now = datetime.now(tz)
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-def _next_slot() -> datetime:
+def _next_regular_slot() -> datetime:
     now = datetime.now(tz)
     candidates = []
     for hh, mm in POST_TIMES:
@@ -76,7 +81,7 @@ async def _notify_admins(text: str):
         except Exception:
             pass
 
-async def _send_preview(when_post: datetime, text: str):
+async def _send_preview(text: str, when_post: datetime):
     safe = html_escape(text or "")
     caption = f"🕒 Предпросмотр поста (публикация в {when_post.strftime('%H:%M %d.%m')}, {TZ})\n\n{safe}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -94,23 +99,15 @@ async def _send_to_channel(text: str):
     except TelegramBadRequest:
         await bot.send_message(CHANNEL_ID, html_escape(text), parse_mode=None, disable_web_page_preview=False)
 
-async def _post_once():
-    row = get_oldest()
-    if not row:
-        await _notify_admins("⛔ Очередь пуста — пост отменён.")
-        return
-    ad_id, text = row
+async def _post_by_ad_id(ad_id: int, text: str):
     await _send_to_channel(text)
     similar = find_similar_ids(ad_id, threshold=0.88)
     removed = bulk_delete([ad_id] + similar)
-
-    # отчёт админам
     now_h = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     await _notify_admins(
         f"✅ Опубликовано ({now_h}). ID: <code>{ad_id}</code>. "
         f"Удалено похожих (включая исходный): <b>{removed}</b>."
     )
-    # опционально — лог в канал
     if POST_REPORT_TO_CHANNEL:
         await _send_to_channel(f"ℹ️ Пост опубликован. ID: {ad_id}. Удалено похожих: {removed}.")
 
@@ -119,29 +116,61 @@ async def run_scheduler():
     times_str = ",".join(f"{hh:02d}:{mm:02d}" for hh, mm in POST_TIMES)
     log.info("Scheduler TZ=%s, times=%s, preview_before=%s min", TZ, times_str, PREVIEW_BEFORE_MIN)
 
-    last_preview_for = None
-    last_post_for = None
+    last_regular_preview_for = None
+    last_regular_post_for = None
 
     while True:
-        next_post = _next_slot()
-        preview_at = next_post - timedelta(minutes=PREVIEW_BEFORE_MIN)
         now = datetime.now(tz)
 
-        # Превью (однократно в каждом окне)
-        if last_preview_for != next_post and preview_at <= now < next_post:
+        # ---------- 1) Регулярные слоты ----------
+        next_post = _next_regular_slot()
+        preview_at = next_post - timedelta(minutes=PREVIEW_BEFORE_MIN)
+
+        # превью для регулярного слота
+        if last_regular_preview_for != next_post and preview_at <= now < next_post:
             row = get_oldest()
             text = row[1] if row else "⛔ Очередь пуста"
-            await _send_preview(next_post, text)
-            last_preview_for = next_post
-            log.info("Превью отправлено. Пост в %s", next_post)
+            await _send_preview(text, next_post)
+            last_regular_preview_for = next_post
+            log.info("Превью (регулярное) отправлено. Пост в %s", next_post)
 
-        # Публикация
-        if last_post_for != next_post and now >= next_post:
-            await _post_once()
-            last_post_for = next_post
+        # публикация регулярного слота — берём текущее самое старое
+        if last_regular_post_for != next_post and now >= next_post:
+            row = get_oldest()
+            if row:
+                ad_id, text = row
+                await _post_by_ad_id(ad_id, text)
+            else:
+                await _notify_admins("⛔ Очередь пуста — регулярный пост пропущен.")
+            last_regular_post_for = next_post
 
-        # инфо-лог при запуске
-        if last_preview_for is None and last_post_for is None:
+        # ---------- 2) Разовые job'ы из /post_at ----------
+        job = job_get_next(int(now.timestamp()))
+        if job:
+            run_at = datetime.fromtimestamp(job["run_at"], tz)
+            j_preview_at = run_at - timedelta(minutes=PREVIEW_BEFORE_MIN)
+
+            # превью job'а
+            if job["preview_sent"] == 0 and j_preview_at <= now < run_at:
+                # текст по ad_id на момент превью всё ещё лежит в очереди
+                # (если админ опубликовал раньше — при публикации job удалим сам job)
+                row = get_oldest()
+                text = row[1] if row and row[0] == job["ad_id"] else "⛔ Пост для job не найден в очереди"
+                await _send_preview(text, run_at)
+                job_mark_preview_sent(job["id"])
+                log.info("Превью (job #%s) отправлено. Пост в %s", job["id"], run_at)
+
+            # публикация job'а ровно в run_at (если ad ещё в очереди)
+            if now >= run_at:
+                row = get_oldest()
+                if row and row[0] == job["ad_id"]:
+                    await _post_by_ad_id(row[0], row[1])
+                else:
+                    await _notify_admins(f"⚠️ Job #{job['id']}: объявление уже отсутствует в очереди — пропущено.")
+                job_delete(job["id"])
+
+        # инфо-лог при самом первом цикле
+        if last_regular_preview_for is None and last_regular_post_for is None:
             delta_h = max(0, (preview_at - now).total_seconds()) / 3600
             log.info("Следующий ПРЕВЬЮ через %.2f часов (%s)", delta_h, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z"))
 
