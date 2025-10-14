@@ -10,6 +10,7 @@ from typing import List
 import pytz
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
 # опционально: храним «когда следующий пост» в мета
 try:
@@ -72,7 +73,7 @@ async def notify_admin(bot: Bot, text: str):
     if not (ADMIN_ID and isinstance(ADMIN_ID, int)):
         return
     try:
-        await bot.send_message(ADMIN_ID, text, disable_web_page_preview=True, parse_mode=ParseMode.HTML)
+        await bot.send_message(ADMIN_ID, text, disable_web_page_preview=True)
     except Exception as e:
         logging.warning(f"notify_admin failed: {e}")
 
@@ -103,7 +104,8 @@ async def run_scheduler():
     times = parse_times(SCHEDULE_TIMES)
 
     logging.info(f"Scheduler TZ={tz.zone}, times={','.join(t.strftime('%H:%M') for t in times)}")
-    bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
     try:
         while True:
@@ -135,7 +137,6 @@ async def run_scheduler():
                 logging.exception(f"Post failed: {e}")
                 await notify_admin(bot, f"❌ Ошибка публикации: <code>{e}</code>")
 
-            # маленькая пауза, чтобы не схлопнуться при одинаковых временах
             await asyncio.sleep(2)
     finally:
         await bot.session.close()
