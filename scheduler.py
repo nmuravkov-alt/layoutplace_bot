@@ -11,24 +11,23 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 
-# DB helpers
+# DB helpers (init_db — АСИНХРОННАЯ!)
 from storage.db import (
-    init_db,
-    get_oldest,
-    delete_by_id,      # импорт оставлен на будущее (не обязателен)
-    find_similar_ids,
-    bulk_delete,
+    init_db,          # async def
+    get_oldest,       # sync
+    delete_by_id,     # sync (резерв)
+    find_similar_ids, # sync
+    bulk_delete,      # sync
 )
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channelusername или -100...
-ADMINS_RAW = os.getenv("ADMINS", "").strip()      # список id через запятую
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или -100...
+ADMINS_RAW = os.getenv("ADMINS", "").strip()      # id через запятую
 TZ = os.getenv("TZ", "Europe/Moscow").strip()
 
-# Время постинга по умолчанию — 12:00, 16:00, 20:00
+# Время постинга и превью (минут)
 TIMES = os.getenv("SCHEDULE_TIMES", "12,16,20")
-# За сколько минут прислать превью админу
 PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
 
 # -------------------- LOG --------------------
@@ -66,7 +65,7 @@ def _now_tz(tz: str) -> datetime:
     return datetime.now(ZoneInfo(tz))
 
 def _next_time(now: datetime, hours: list[int]) -> datetime:
-    """Ближайшее время сегодня/завтра из списка часов (минуты=00)."""
+    """Ближайшее время из списка часов (минуты=00)."""
     candidates = []
     for h in hours:
         cand = now.replace(hour=h, minute=0, second=0, microsecond=0)
@@ -82,7 +81,7 @@ def _channel_id_value() -> int | str:
     cid = CHANNEL_ID
     if cid.lstrip("-").isdigit():
         return int(cid)
-    return cid  # например "@layoutplace"
+    return cid
 
 HOURS = _parse_times(TIMES)
 ADMINS = _parse_admins(ADMINS_RAW)
@@ -90,7 +89,7 @@ CHANNEL = _channel_id_value()
 
 # -------------------- CORE --------------------
 async def send_preview_to_admins(bot: Bot, when_post: datetime, text: str):
-    """Всегда шлём превью только в личку админам (экранировано)."""
+    """Всегда шлём превью только в личку админам."""
     if not ADMINS:
         log.warning("ADMINS пуст — некому отправлять превью.")
         return
@@ -102,30 +101,26 @@ async def send_preview_to_admins(bot: Bot, when_post: datetime, text: str):
         try:
             await bot.send_message(uid, caption)
         except TelegramBadRequest:
-            # на всякий случай ещё раз plain
             await bot.send_message(uid, caption)
 
 async def send_to_channel(bot: Bot, text: str):
-    """Постинг в канал: пытаемся как HTML, при ошибке — экранируем."""
+    """Постинг в канал: сперва HTML, при ошибке — экранированный текст."""
     try:
         await bot.send_message(CHANNEL, text, parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
-        safe = _escape(text)
-        await bot.send_message(CHANNEL, safe)
+        await bot.send_message(CHANNEL, _escape(text))
 
 async def do_post(bot: Bot):
-    """Берём самое старое объявление, постим и удаляем похожие."""
+    """Берём самое старое, постим и удаляем похожие."""
     row = get_oldest()
     if not row:
         log.info("Очередь пуста — постить нечего.")
         return
-
     ad_id = row["id"]
     text = row["text"]
 
     await send_to_channel(bot, text)
 
-    # Удаляем сам пост и похожие
     ids = find_similar_ids(text)
     if ad_id not in ids:
         ids.append(ad_id)
@@ -136,8 +131,8 @@ async def run_scheduler():
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("Не заданы BOT_TOKEN/CHANNEL_ID")
 
-    # Инициализируем БД (создаст таблицы при первом запуске)
-    init_db()
+    # ВАЖНО: init_db асинхронная — обязательно await!
+    await init_db()
 
     bot = Bot(
         token=BOT_TOKEN,
@@ -157,22 +152,21 @@ async def run_scheduler():
         post_at = _next_time(now, HOURS)
         preview_at = post_at - timedelta(minutes=PREVIEW_MINUTES)
 
-        # превью (всегда только админам)
-        if (last_preview_for != post_at) and (now >= preview_at) and (now < post_at):
+        # превью (только админам)
+        if (last_preview_for != post_at) and (preview_at <= now < post_at):
             row = get_oldest()
             preview_text = row["text"] if row else "⛔ Очередь пуста"
             await send_preview_to_admins(bot, post_at, preview_text)
             last_preview_for = post_at
-            log.info("Превью отправлено. Следующий пост в %s", post_at)
+            log.info("Превью отправлено. Пост в %s", post_at)
 
         # публикация
         if (last_post_for != post_at) and (now >= post_at):
             await do_post(bot)
             last_post_for = post_at
-            # небольшая пауза, чтобы не дёргать цикл сразу после публикации
             await asyncio.sleep(2)
 
-        # информативный лог один раз при старте
+        # информативный лог при старте
         if last_preview_for is None and last_post_for is None:
             delta_h = (preview_at - now).total_seconds() / 3600
             log.info(
