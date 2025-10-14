@@ -1,6 +1,4 @@
 # scheduler.py
-# Превью админам за N минут до поста, пост в канал, отчёт админам и (опционально) в канал.
-
 import asyncio
 import logging
 import os
@@ -11,12 +9,12 @@ from html import escape as html_escape
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.exceptions import TelegramBadRequest
 
 from storage.db import (
     init_db,
     get_oldest,
-    delete_by_id,
     find_similar_ids,
     bulk_delete,
 )
@@ -81,9 +79,12 @@ async def _notify_admins(text: str):
 async def _send_preview(when_post: datetime, text: str):
     safe = html_escape(text or "")
     caption = f"🕒 Предпросмотр поста (публикация в {when_post.strftime('%H:%M %d.%m')}, {TZ})\n\n{safe}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data="postnow")]
+    ])
     for uid in ADMINS:
         try:
-            await bot.send_message(uid, caption)
+            await bot.send_message(uid, caption, reply_markup=kb)
         except Exception:
             pass
 
@@ -139,7 +140,7 @@ async def run_scheduler():
             await _post_once()
             last_post_for = next_post
 
-        # информационный лог при запуске
+        # инфо-лог при запуске
         if last_preview_for is None and last_post_for is None:
             delta_h = max(0, (preview_at - now).total_seconds()) / 3600
             log.info("Следующий ПРЕВЬЮ через %.2f часов (%s)", delta_h, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z"))
