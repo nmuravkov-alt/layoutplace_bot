@@ -15,7 +15,7 @@ from aiogram.exceptions import TelegramBadRequest
 from storage.db import (
     init_db,
     get_oldest,
-    delete_by_id,
+    delete_by_id,      # импорт оставлен на будущее (не обязателен)
     find_similar_ids,
     bulk_delete,
 )
@@ -26,19 +26,13 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @channelusername или -100
 ADMINS_RAW = os.getenv("ADMINS", "").strip()      # список id через запятую
 TZ = os.getenv("TZ", "Europe/Moscow").strip()
 
-# Время постинга: по умолчанию 12:00, 16:00, 20:00
+# Время постинга по умолчанию — 12:00, 16:00, 20:00
 TIMES = os.getenv("SCHEDULE_TIMES", "12,16,20")
-# За сколько минут прислать превью (уведомление с текстом поста)
+# За сколько минут прислать превью админу
 PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
 
-# Куда отправлять превью: admins (личка всем админам) или channel (в канал как сервисное)
-PREVIEW_TARGET = os.getenv("PREVIEW_TARGET", "admins").lower()  # admins | channel
-
 # -------------------- LOG --------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s | %(name)s : %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s : %(message)s")
 log = logging.getLogger("scheduler")
 
 # -------------------- UTILS --------------------
@@ -81,12 +75,10 @@ def _next_time(now: datetime, hours: list[int]) -> datetime:
         candidates.append(cand)
     return min(candidates)
 
-def _escape_for_preview(text: str) -> str:
-    """Превью шлем безопасно (без парсинга HTML)."""
+def _escape(text: str) -> str:
     return html_escape(text or "")
 
 def _channel_id_value() -> int | str:
-    # поддержка @username и числового id
     cid = CHANNEL_ID
     if cid.lstrip("-").isdigit():
         return int(cid)
@@ -97,39 +89,32 @@ ADMINS = _parse_admins(ADMINS_RAW)
 CHANNEL = _channel_id_value()
 
 # -------------------- CORE --------------------
-async def send_preview(bot: Bot, when_post: datetime, text: str):
+async def send_preview_to_admins(bot: Bot, when_post: datetime, text: str):
+    """Всегда шлём превью только в личку админам (экранировано)."""
+    if not ADMINS:
+        log.warning("ADMINS пуст — некому отправлять превью.")
+        return
     caption = (
-        f"🕒 ПРЕВЬЮ поста на {when_post.strftime('%Y-%m-%d %H:%M')} "
-        f"({TZ})\n\n{text}"
+        f"🕒 ПРЕВЬЮ поста на {when_post.strftime('%Y-%m-%d %H:%M')} ({TZ})\n\n"
+        f"{_escape(text)}"
     )
-
-    if PREVIEW_TARGET == "channel":
+    for uid in ADMINS:
         try:
-            await bot.send_message(CHANNEL, caption, parse_mode=ParseMode.HTML)
+            await bot.send_message(uid, caption)
         except TelegramBadRequest:
-            # если вдруг ломается парсер — отправим без разметки
-            await bot.send_message(CHANNEL, html_escape(caption))
-    else:
-        # в личку всем админам — без риска парсинга
-        safe = _escape_for_preview(caption)
-        for uid in ADMINS:
-            try:
-                await bot.send_message(uid, safe)
-            except TelegramBadRequest:
-                # на всякий случай продублируем ещё раз plain (обычно не требуется)
-                await bot.send_message(uid, safe)
+            # на всякий случай ещё раз plain
+            await bot.send_message(uid, caption)
 
 async def send_to_channel(bot: Bot, text: str):
-    """Постинг в канал с защитой от кривого HTML."""
+    """Постинг в канал: пытаемся как HTML, при ошибке — экранируем."""
     try:
         await bot.send_message(CHANNEL, text, parse_mode=ParseMode.HTML)
     except TelegramBadRequest:
-        # если в тексте есть неразрешённые теги — отправим экранированный вариант
-        safe = html_escape(text)
+        safe = _escape(text)
         await bot.send_message(CHANNEL, safe)
 
 async def do_post(bot: Bot):
-    """Берём самое старое объявление, постим и чистим похожие."""
+    """Берём самое старое объявление, постим и удаляем похожие."""
     row = get_oldest()
     if not row:
         log.info("Очередь пуста — постить нечего.")
@@ -151,7 +136,7 @@ async def run_scheduler():
     if not BOT_TOKEN or not CHANNEL_ID:
         raise RuntimeError("Не заданы BOT_TOKEN/CHANNEL_ID")
 
-    # инициализация БД
+    # Инициализируем БД (создаст таблицы при первом запуске)
     init_db()
 
     bot = Bot(
@@ -159,7 +144,6 @@ async def run_scheduler():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
-    tz = ZoneInfo(TZ)
     log.info(
         "Scheduler  TZ=%s, times=%s, preview_before=%s min",
         TZ, ",".join(map(str, HOURS)), PREVIEW_MINUTES
@@ -173,30 +157,27 @@ async def run_scheduler():
         post_at = _next_time(now, HOURS)
         preview_at = post_at - timedelta(minutes=PREVIEW_MINUTES)
 
-        # отправка превью
+        # превью (всегда только админам)
         if (last_preview_for != post_at) and (now >= preview_at) and (now < post_at):
             row = get_oldest()
-            if row:
-                await send_preview(bot, post_at, _escape_for_preview(row["text"]))
-            else:
-                # информируем, что очередь пуста
-                await send_preview(bot, post_at, _escape_for_preview("⛔ Очередь пуста"))
+            preview_text = row["text"] if row else "⛔ Очередь пуста"
+            await send_preview_to_admins(bot, post_at, preview_text)
             last_preview_for = post_at
             log.info("Превью отправлено. Следующий пост в %s", post_at)
 
-        # сам пост
+        # публикация
         if (last_post_for != post_at) and (now >= post_at):
             await do_post(bot)
             last_post_for = post_at
-            # после поста перевычислим следующее окно, чтобы не крутиться впустую
+            # небольшая пауза, чтобы не дёргать цикл сразу после публикации
             await asyncio.sleep(2)
 
-        # информативный лог один раз при старте цикла
+        # информативный лог один раз при старте
         if last_preview_for is None and last_post_for is None:
-            delta = (preview_at - now).total_seconds() / 3600
+            delta_h = (preview_at - now).total_seconds() / 3600
             log.info(
                 "Следующий ПРЕВЬЮ через %.2f часов (%s)",
-                delta, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z")
+                delta_h, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z")
             )
 
         await asyncio.sleep(10)
