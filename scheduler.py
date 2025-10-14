@@ -1,182 +1,189 @@
 # scheduler.py
-# 1) Регулярные слоты (напр. 12:00,16:00,20:00) с превью за N минут и кнопкой «Опубликовать сейчас»
-# 2) Разовые job'ы из /post_at HH:MM (храним ad_id и время), с превью за N минут
-
+import os
 import asyncio
 import logging
-import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from html import escape as html_escape
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.exceptions import TelegramBadRequest
 
 from storage.db import (
     init_db,
-    get_oldest,
-    find_similar_ids,
-    bulk_delete,
-    job_get_next,
-    job_mark_preview_sent,
-    job_delete,
+    queue_next_pending,
+    queue_mark_status,
+    queue_count_pending,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
-ADMINS_RAW = os.getenv("ADMINS", "").strip()
-TZ = os.getenv("TZ", "Europe/Moscow")
-POST_TIMES_RAW = os.getenv("POST_TIMES", "12,16,20")
-PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
-POST_REPORT_TO_CHANNEL = os.getenv("POST_REPORT_TO_CHANNEL", "0").strip() == "1"
-
-tz = ZoneInfo(TZ)
-ADMINS = []
-for p in ADMINS_RAW.replace(";", ",").split(","):
-    p = p.strip()
-    if p and p.lstrip("-").isdigit():
-        ADMINS.append(int(p))
-
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("scheduler")
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или -100...
+ADMINS = [a.strip() for a in os.getenv("ADMINS", "").split(",") if a.strip()]
+TZ_NAME = os.getenv("TZ", "Europe/Moscow")
+# часы публикации
+TIMES_RAW = os.getenv("TIMES", "12:00,16:00,20:00")
+# превью за N минут до слота
+PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
 
-def _parse_times(raw: str):
+tz = ZoneInfo(TZ_NAME)
+
+def _parse_times(s: str) -> list[dtime]:
     out = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
+    for token in s.split(","):
+        token = token.strip()
+        if not token:
             continue
-        if ":" in part:
-            hh, mm = part.split(":", 1)
-            out.append((int(hh), int(mm)))
-        else:
-            out.append((int(part), 0))
-    return out or [(12, 0), (16, 0), (20, 0)]
+        h, m = token.split(":")
+        out.append(dtime(hour=int(h), minute=int(m)))
+    return out
 
-POST_TIMES = _parse_times(POST_TIMES_RAW)
+TIMES = _parse_times(TIMES_RAW)
 
-def _today_at(hh: int, mm: int) -> datetime:
-    now = datetime.now(tz)
-    return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+def _utcnow():
+    return datetime.now(tz)
 
-def _next_regular_slot() -> datetime:
-    now = datetime.now(tz)
-    candidates = []
-    for hh, mm in POST_TIMES:
-        t = _today_at(hh, mm)
-        if t <= now:
-            t += timedelta(days=1)
-        candidates.append(t)
-    return min(candidates)
+def _next_run(now: datetime, slots: list[dtime]) -> datetime:
+    today_slots = [datetime.combine(now.date(), t, tzinfo=tz) for t in slots]
+    future = [dt for dt in today_slots if dt > now]
+    if future:
+        return future[0]
+    # завтра, самый ранний слот
+    tomorrow = now.date() + timedelta(days=1)
+    return datetime.combine(tomorrow, slots[0], tzinfo=tz)
 
-async def _notify_admins(text: str):
-    for uid in ADMINS:
+async def _notify_admins(bot: Bot, text: str):
+    for aid in ADMINS:
         try:
-            await bot.send_message(uid, text, disable_web_page_preview=True)
+            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        except Exception as e:
+            log.exception("Не удалось отправить админу %s: %s", aid, e)
+
+# ---------------- форматирование подписи ----------------
+def unify_caption(text: str | None) -> str:
+    text = (text or "").strip()
+
+    # простые правки
+    text = text.replace("Цена -", "Цена —").replace("Цена — ", "Цена — ")
+    text = text.replace("Размер:", "Размер:").replace("Состояние :", "Состояние :").replace("Состояние:", "Состояние :")
+    # убираем двойные пробелы и пустые строки
+    lines = [ln.strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+    text = "\n".join(lines)
+
+    # добавим «Общие» ссылки, если их нет
+    if "layoutplacebuy" not in text:
+        text += "\n\n@layoutplacebuy"
+    if "#штаны" in text or "#куртки" in text or "#аксессуары" in text:
+        # ок — теги уже есть
+        pass
+
+    return text
+
+# --------------- копирование поста и удаление оригинала ---------------
+async def copy_and_delete(bot: Bot, source_chat_id: int, message_ids: list[int], target: str | int, caption_override: str | None):
+    # Копируем пачкой по одному сообщению
+    posted_message_ids: list[int] = []
+    caption = unify_caption(caption_override)
+    for idx, mid in enumerate(message_ids):
+        try:
+            if idx == 0 and caption:
+                msg = await bot.copy_message(
+                    chat_id=target,
+                    from_chat_id=source_chat_id,
+                    message_id=mid,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                msg = await bot.copy_message(
+                    chat_id=target,
+                    from_chat_id=source_chat_id,
+                    message_id=mid
+                )
+            posted_message_ids.append(msg.message_id)
+        except Exception as e:
+            log.exception("Ошибка копирования message_id=%s: %s", mid, e)
+            raise
+
+    # Удаляем оригиналы (если у бота есть права)
+    for mid in message_ids:
+        try:
+            await bot.delete_message(chat_id=source_chat_id, message_id=mid)
         except Exception:
+            # не критично — бывает нет прав на удаление старых сообщений
             pass
 
-async def _send_preview(text: str, when_post: datetime):
-    safe = html_escape(text or "")
-    caption = f"🕒 Предпросмотр поста (публикация в {when_post.strftime('%H:%M %d.%m')}, {TZ})\n\n{safe}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data="postnow")]
-    ])
-    for uid in ADMINS:
-        try:
-            await bot.send_message(uid, caption, reply_markup=kb)
-        except Exception:
-            pass
+    return posted_message_ids
 
-async def _send_to_channel(text: str):
-    try:
-        await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=False)
-    except TelegramBadRequest:
-        await bot.send_message(CHANNEL_ID, html_escape(text), parse_mode=None, disable_web_page_preview=False)
-
-async def _post_by_ad_id(ad_id: int, text: str):
-    await _send_to_channel(text)
-    similar = find_similar_ids(ad_id, threshold=0.88)
-    removed = bulk_delete([ad_id] + similar)
-    now_h = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
-    await _notify_admins(
-        f"✅ Опубликовано ({now_h}). ID: <code>{ad_id}</code>. "
-        f"Удалено похожих (включая исходный): <b>{removed}</b>."
-    )
-    if POST_REPORT_TO_CHANNEL:
-        await _send_to_channel(f"ℹ️ Пост опубликован. ID: {ad_id}. Удалено похожих: {removed}.")
-
+# ---------------- основной цикл ----------------
 async def run_scheduler():
-    init_db()
-    times_str = ",".join(f"{hh:02d}:{mm:02d}" for hh, mm in POST_TIMES)
-    log.info("Scheduler TZ=%s, times=%s, preview_before=%s min", TZ, times_str, PREVIEW_BEFORE_MIN)
+    props = DefaultBotProperties(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    bot = Bot(BOT_TOKEN, default=props)
 
-    last_regular_preview_for = None
-    last_regular_post_for = None
+    await _notify_admins(bot, f"🕒 Планировщик запущен.\nСлоты: <code>{TIMES_RAW}</code>\nПревью: <b>{PREVIEW_BEFORE_MIN}</b> мин.\nОчередь: <b>{queue_count_pending()}</b>")
 
     while True:
-        now = datetime.now(tz)
+        now = _utcnow()
+        next_slot = _next_run(now, TIMES)
+        # момент превью
+        preview_at = next_slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
+        if preview_at < now:
+            # если «опоздали» — превью сразу
+            preview_at = now + timedelta(seconds=5)
 
-        # ---------- 1) Регулярные слоты ----------
-        next_post = _next_regular_slot()
-        preview_at = next_post - timedelta(minutes=PREVIEW_BEFORE_MIN)
+        # Ждём превью
+        delay_preview = max(0.0, (preview_at - _utcnow()).total_seconds())
+        await asyncio.sleep(delay_preview)
 
-        # превью для регулярного слота
-        if last_regular_preview_for != next_post and preview_at <= now < next_post:
-            row = get_oldest()
-            text = row[1] if row else "⛔ Очередь пуста"
-            await _send_preview(text, next_post)
-            last_regular_preview_for = next_post
-            log.info("Превью (регулярное) отправлено. Пост в %s", next_post)
+        row = queue_next_pending()
+        if row:
+            # превью админу
+            preview_text = (
+                f"👀 Предпросмотр на {next_slot.strftime('%H:%M')}:\n"
+                f"<i>источник</i>: <code>{row['source_chat_id']}</code>\n"
+                f"<i>messages</i>: <code>{row['message_ids']}</code>"
+            )
+            await _notify_admins(bot, preview_text)
+            queue_mark_status(row["id"], "previewed")
+        else:
+            await _notify_admins(bot, "ℹ️ Очередь пуста — публиковать нечего.")
 
-        # публикация регулярного слота — берём текущее самое старое
-        if last_regular_post_for != next_post and now >= next_post:
-            row = get_oldest()
-            if row:
-                ad_id, text = row
-                await _post_by_ad_id(ad_id, text)
-            else:
-                await _notify_admins("⛔ Очередь пуста — регулярный пост пропущен.")
-            last_regular_post_for = next_post
+        # Ждём сам слот
+        delay_post = max(0.0, (next_slot - _utcnow()).total_seconds())
+        await asyncio.sleep(delay_post)
 
-        # ---------- 2) Разовые job'ы из /post_at ----------
-        job = job_get_next(int(now.timestamp()))
-        if job:
-            run_at = datetime.fromtimestamp(job["run_at"], tz)
-            j_preview_at = run_at - timedelta(minutes=PREVIEW_BEFORE_MIN)
+        # Публикация
+        row = queue_next_pending()
+        if not row:
+            log.info("Слот %s: очередь пуста", next_slot)
+            continue
 
-            # превью job'а
-            if job["preview_sent"] == 0 and j_preview_at <= now < run_at:
-                # текст по ad_id на момент превью всё ещё лежит в очереди
-                # (если админ опубликовал раньше — при публикации job удалим сам job)
-                row = get_oldest()
-                text = row[1] if row and row[0] == job["ad_id"] else "⛔ Пост для job не найден в очереди"
-                await _send_preview(text, run_at)
-                job_mark_preview_sent(job["id"])
-                log.info("Превью (job #%s) отправлено. Пост в %s", job["id"], run_at)
+        try:
+            message_ids = [int(x) for x in eval(row["message_ids"])]
+        except Exception:
+            import json
+            message_ids = [int(x) for x in json.loads(row["message_ids"])]
 
-            # публикация job'а ровно в run_at (если ad ещё в очереди)
-            if now >= run_at:
-                row = get_oldest()
-                if row and row[0] == job["ad_id"]:
-                    await _post_by_ad_id(row[0], row[1])
-                else:
-                    await _notify_admins(f"⚠️ Job #{job['id']}: объявление уже отсутствует в очереди — пропущено.")
-                job_delete(job["id"])
-
-        # инфо-лог при самом первом цикле
-        if last_regular_preview_for is None and last_regular_post_for is None:
-            delta_h = max(0, (preview_at - now).total_seconds()) / 3600
-            log.info("Следующий ПРЕВЬЮ через %.2f часов (%s)", delta_h, preview_at.strftime("%Y-%m-%d %H:%M:%S %Z"))
-
-        await asyncio.sleep(10)
+        try:
+            await copy_and_delete(
+                bot=bot,
+                source_chat_id=int(row["source_chat_id"]),
+                message_ids=message_ids,
+                target=CHANNEL_ID,
+                caption_override=row.get("caption_override")
+            )
+            queue_mark_status(row["id"], "posted")
+            await _notify_admins(bot, f"✅ Опубликовано из <code>{row['source_chat_id']}</code> ids={message_ids}")
+        except Exception as e:
+            queue_mark_status(row["id"], "error")
+            await _notify_admins(bot, f"❌ Ошибка публикации id={row['id']}: <code>{e}</code>")
 
 async def main():
+    init_db()
+    log.info("Scheduler  TZ=%s, times=%s, preview_before=%s min", TZ_NAME, TIMES_RAW, PREVIEW_BEFORE_MIN)
     await run_scheduler()
 
 if __name__ == "__main__":
