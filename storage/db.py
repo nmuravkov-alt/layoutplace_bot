@@ -1,5 +1,5 @@
 # storage/db.py
-# SQLite-хранилище объявлений + утилиты
+# SQLite-хранилище объявлений + планировщик разовых постов
 
 import os
 import re
@@ -7,7 +7,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from difflib import SequenceMatcher
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union, Dict
 
 DB_PATH = os.getenv("DB_PATH", "storage/db.sqlite")
 
@@ -25,7 +25,6 @@ def _cx():
 _word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
 
 def _normalize(text: str) -> str:
-    # убрать лишние пробелы, привести к нижнему, оставить буквы/цифры
     text = re.sub(r"\s+", " ", (text or "")).strip()
     tokens = _word_re.findall(text.lower())
     return " ".join(tokens)
@@ -48,57 +47,56 @@ def init_db() -> None:
         cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_created ON ads(created_at)")
         cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_norm ON ads(norm)")
 
-# ---- базовые операции ----
+        # Разовые задания (job на конкретный ad_id)
+        cx.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jobs (
+              id            INTEGER PRIMARY KEY AUTOINCREMENT,
+              ad_id         INTEGER NOT NULL,
+              run_at        INTEGER NOT NULL,
+              preview_sent  INTEGER NOT NULL DEFAULT 0,
+              created_at    INTEGER NOT NULL
+            )
+            """
+        )
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_run_at ON jobs(run_at)")
+        cx.execute("CREATE INDEX IF NOT EXISTS idx_jobs_ad_id ON jobs(ad_id)")
+
+# ---------------- базовые операции по очереди ----------------
 
 def is_duplicate(text: str) -> Optional[int]:
-    """Если в базе есть запись с таким же norm — вернуть её id, иначе None."""
     norm = _normalize(text)
     with _cx() as cx:
         row = cx.execute("SELECT id FROM ads WHERE norm = ? LIMIT 1", (norm,)).fetchone()
         return int(row["id"]) if row else None
 
 def enqueue(text: str) -> int:
-    """Добавить объявление (если дубль — вернуть существующий id)."""
     dup = is_duplicate(text)
     if dup:
         return dup
     norm = _normalize(text)
     ts = int(time.time())
     with _cx() as cx:
-        cur = cx.execute(
-            "INSERT INTO ads(text, norm, created_at) VALUES (?,?,?)",
-            (text.strip(), norm, ts),
-        )
+        cur = cx.execute("INSERT INTO ads(text, norm, created_at) VALUES (?,?,?)", (text.strip(), norm, ts))
         return int(cur.lastrowid)
 
 def get_oldest(
-    limit: int = 1,
-    *,
-    count_only: bool = False
+    limit: int = 1, *, count_only: bool = False
 ) -> Union[int, Optional[Tuple[int, str]], List[Tuple[int, str]]]:
-    """
-    Возвращает самое старое объявление (или несколько).
-    - count_only=True -> вернуть количество записей (int).
-    - limit=1 -> вернуть (id, text) или None, если очередь пуста.
-    - limit>1 -> вернуть список [(id, text), ...] (может быть пустым).
-    """
     with _cx() as cx:
         if count_only:
             row = cx.execute("SELECT COUNT(*) AS c FROM ads").fetchone()
             return int(row["c"]) if row else 0
-
         rows = cx.execute(
             "SELECT id, text FROM ads ORDER BY created_at ASC LIMIT ?",
             (int(limit),),
         ).fetchall()
-
     items = [(int(r["id"]), str(r["text"])) for r in rows]
     if limit == 1:
         return items[0] if items else None
     return items
 
 def list_queue(limit: int = 10) -> List[Tuple[int, str, int]]:
-    """Вернуть список (id, text, created_at) по старшинству."""
     with _cx() as cx:
         rows = cx.execute(
             "SELECT id, text, created_at FROM ads ORDER BY created_at ASC LIMIT ?",
@@ -121,13 +119,11 @@ def bulk_delete(ids: Iterable[int]) -> int:
         return int(cur.rowcount)
 
 def find_similar_ids(ad_id: int, *, threshold: float = 0.88) -> List[int]:
-    """Найти похожие к ad_id по norm/similarity (без самого ad_id)."""
     with _cx() as cx:
         base = cx.execute("SELECT norm FROM ads WHERE id = ?", (int(ad_id),)).fetchone()
         if not base:
             return []
         base_norm = str(base["norm"])
-        # быстрый грубый фильтр: ищем записи, где есть хотя бы одно общее слово
         first_token = base_norm.split(" ")[0] if base_norm else ""
         if first_token:
             like = f"%{first_token}%"
@@ -146,3 +142,37 @@ def find_similar_ids(ad_id: int, *, threshold: float = 0.88) -> List[int]:
         if _similar(base_norm, nn) >= threshold:
             out.append(nid)
     return out
+
+# ---------------- разовые задания (jobs) ----------------
+
+def job_create(ad_id: int, run_at_ts: int) -> int:
+    with _cx() as cx:
+        cur = cx.execute(
+            "INSERT INTO jobs(ad_id, run_at, created_at) VALUES (?,?,?)",
+            (int(ad_id), int(run_at_ts), int(time.time())),
+        )
+        return int(cur.lastrowid)
+
+def job_get_next(now_ts: int) -> Optional[Dict]:
+    """Следующая job (по времени run_at), которая ещё не выполнена (run_at >= now - 2д)."""
+    with _cx() as cx:
+        row = cx.execute(
+            "SELECT id, ad_id, run_at, preview_sent FROM jobs WHERE run_at >= ? ORDER BY run_at ASC LIMIT 1",
+            (int(now_ts) - 172800,),  # -2 суток запас
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row["id"]),
+            "ad_id": int(row["ad_id"]),
+            "run_at": int(row["run_at"]),
+            "preview_sent": int(row["preview_sent"]),
+        }
+
+def job_mark_preview_sent(job_id: int) -> None:
+    with _cx() as cx:
+        cx.execute("UPDATE jobs SET preview_sent = 1 WHERE id = ?", (int(job_id),))
+
+def job_delete(job_id: int) -> None:
+    with _cx() as cx:
+        cx.execute("DELETE FROM jobs WHERE id = ?", (int(job_id),))
