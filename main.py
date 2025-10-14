@@ -33,7 +33,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("layoutplace_bot")
 
 # ---------------- CONFIG ----------------
-ADMINS: List[int] = [469734432, 6773668793]  # твои ID
+# Твои админы (жёстко прописал, как просил)
+ADMINS: List[int] = [469734432, 6773668793]
 CHANNEL_ID: str | int = _CHANNEL_ID
 TZ: str = _TZ
 tz = ZoneInfo(TZ)
@@ -139,7 +140,7 @@ async def cmd_start(m: Message):
         "Бот готов к работе.\n\n"
         "<b>Команды:</b>\n"
         "/myid — показать твой Telegram ID\n"
-        "/enqueue <текст> — добавить текст в очередь\n"
+        "/enqueue <code>&lt;текст&gt;</code> — добавить текст в очередь\n"
         "/queue — показать состояние очередей\n"
         "/post_oldest — опубликовать старое объявление\n"
         "/add_post — добавить одиночный пост из канала\n"
@@ -175,7 +176,7 @@ async def cmd_enqueue(m: Message, command: CommandObject):
         return await m.answer("Нет прав.")
     text = (command.args or "").strip()
     if not text:
-        return await m.answer("Использование: /enqueue <текст>")
+        return await m.answer("Использование: <code>/enqueue &lt;текст&gt;</code>")
     text = unify_caption(text)
     ad_id = db_enqueue(text)
     await m.answer(f"Добавлено в очередь: <code>{ad_id}</code>")
