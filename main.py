@@ -73,17 +73,16 @@ async def _send_to_channel(text: str):
 
 # ------------------------ команды ------------------------
 
-@dp.message(Command("start"))
+@dp.message(Command("start")))
 async def cmd_start(m: Message):
     help_text = (
         "Готов к работе.\n\n"
-        "<b>Команды</b>:\n"
+        "<b>Команды:</b>\n"
         "/myid — показать твой Telegram ID\n"
-        "/enqueue <текст> — положить объявление в очередь\n"
+        "/enqueue &lt;текст&gt; — положить объявление в очередь\n"
         "/queue — показать размер очереди\n"
         "/post_oldest — опубликовать самое старое и удалить похожие\n"
         "/now — текущее время сервера\n"
-        "/plans — показать запланированные (для отладки)\n"
     )
     await m.answer(help_text)
 
