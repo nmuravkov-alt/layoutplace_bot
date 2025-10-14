@@ -76,17 +76,26 @@ def get_oldest(
     *,
     count_only: bool = False
 ) -> Union[int, Optional[Tuple[int, str]], List[Tuple[int, str]]]:
-    """Старейшие объявления; count_only — вернуть количество."""
+    """
+    Возвращает самое старое объявление (или несколько).
+    - count_only=True -> вернуть количество записей (int).
+    - limit=1 -> вернуть (id, text) или None, если очередь пуста.
+    - limit>1 -> вернуть список [(id, text), ...] (может быть пустым).
+    """
     with _cx() as cx:
         if count_only:
             row = cx.execute("SELECT COUNT(*) AS c FROM ads").fetchone()
             return int(row["c"]) if row else 0
+
         rows = cx.execute(
             "SELECT id, text FROM ads ORDER BY created_at ASC LIMIT ?",
-            (limit,),
+            (int(limit),),
         ).fetchall()
-        items = [(int(r["id"]), str(r["text"])) for r in rows]
-        return items[0] if limit == 1 else items
+
+    items = [(int(r["id"]), str(r["text"])) for r in rows]
+    if limit == 1:
+        return items[0] if items else None
+    return items
 
 def list_queue(limit: int = 10) -> List[Tuple[int, str, int]]:
     """Вернуть список (id, text, created_at) по старшинству."""
