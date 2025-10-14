@@ -2,159 +2,166 @@
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 from aiogram import Bot
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# --- БД-утилиты ---
 from storage.db import (
     init_db,
     get_oldest,
     delete_by_id,
     find_similar_ids,
     bulk_delete,
+    plan_create,
+    plan_get,
+    plan_cancel,   # (может пригодиться в будущем)
+    plan_clear_old,
 )
 
-# ----------------- Конфиг -----------------
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID  = os.getenv("CHANNEL_ID", "").strip()      # @username или -100...
-ADMINS_RAW  = os.getenv("ADMINS", "").strip()          # "123, 456 789"
-TZ_NAME     = os.getenv("TZ", "Europe/Moscow").strip()
-POST_TIMES  = os.getenv("POST_TIMES", "12,16,20").strip()  # часы через запятую
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("scheduler")
 
-def _parse_admins(raw: str) -> list[int]:
-    parts = [p.strip() for p in raw.replace(",", " ").split()]
-    out: list[int] = []
-    for p in parts:
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+ADMINS_RAW = os.getenv("ADMINS", "").strip()
+TZ = os.getenv("TZ", "Europe/Moscow")
+
+SCHEDULE_TIMES = os.getenv("SCHEDULE_TIMES", "12,16,20")  # ЧЧ через запятую
+PREVIEW_BEFORE_MINUTES = int(os.getenv("PREVIEW_BEFORE_MINUTES", "15"))
+
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+def _parse_admins(raw: str):
+    ids = []
+    for p in (raw or "").replace(";", ",").split(","):
+        p = p.strip()
+        if not p:
+            continue
         try:
-            out.append(int(p))
+            ids.append(int(p))
         except ValueError:
             pass
-    return out
+    return ids
 
-ADMINS: list[int] = _parse_admins(ADMINS_RAW)
-TZ = ZoneInfo(TZ_NAME)
+ADMINS = _parse_admins(ADMINS_RAW)
 
-def _parse_hours(raw: str) -> list[int]:
-    hours: list[int] = []
-    for p in raw.replace("/", ",").split(","):
+def _tznow():
+    try:
+        import pytz
+        tz = pytz.timezone(TZ)
+        return datetime.now(tz)
+    except Exception:
+        return datetime.utcnow()
+
+def _mk_token(run_at_ts: int, ad_id: int) -> str:
+    return f"{run_at_ts}:{ad_id}"
+
+async def _notify_admins(text: str, reply_markup=None):
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception as e:
+            log.warning("notify admin %s failed: %s", admin_id, e)
+
+def _next_run_after(now_dt: datetime):
+    hours = []
+    for p in SCHEDULE_TIMES.split(","):
         p = p.strip()
         if not p:
             continue
         try:
             h = int(p)
-            if 0 <= h <= 23:
+            if 0 <= h < 24:
                 hours.append(h)
         except ValueError:
-            continue
-    hours = sorted(set(hours))
-    return hours or [12, 16, 20]
+            pass
+    if not hours:
+        hours = [12, 16, 20]
+    hours = sorted(hours)
 
-HOURS = _parse_hours(POST_TIMES)
+    # собрать все слоты сегодня/завтра и выбрать ближайший > now
+    candidates = []
+    today = now_dt.replace(minute=0, second=0, microsecond=0)
+    for add in [0, 1, 2]:
+        base = today + timedelta(days=add)
+        for h in hours:
+            candidates.append(base.replace(hour=h))
+    for dt in candidates:
+        if dt > now_dt:
+            return dt
+    return candidates[-1]
 
-# ----------------- Логирование -----------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("scheduler")
+async def _send_preview(run_at_ts: int, ad_id: int, text: str):
+    token = _mk_token(run_at_ts, ad_id)
+    plan_create(token, ad_id, run_at_ts, int(time.time()))
+    when_str = datetime.fromtimestamp(run_at_ts).strftime("%Y-%m-%d %H:%M:%S")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить пост", callback_data=f"cancel:{token}")]
+    ])
+    await _notify_admins(
+        f"🔔 Предстоящий пост в <b>{when_str}</b>\n"
+        f"token: <code>{token}</code>\n\n"
+        f"{text}",
+        reply_markup=kb,
+    )
 
-# ----------------- Хелперы -----------------
-def now() -> datetime:
-    return datetime.now(TZ)
+async def _post_to_channel(ad_id: int, text: str):
+    await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=False)
+    sims = find_similar_ids(ad_id)
+    delete_by_id(ad_id)
+    bulk_delete(sims)
+    await _notify_admins(f"✅ Опубликовано объявление id={ad_id}. Удалено похожих: <b>{len(sims)}</b>")
 
-def human_dt(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S %Z")
-
-def next_run_after(dt: datetime) -> datetime:
-    """Следующее время запуска ≥ dt по списку часов HOURS."""
-    base = dt.replace(minute=0, second=0, microsecond=0)
-    today_candidates = [base.replace(hour=h) for h in HOURS]
-    for cand in today_candidates:
-        if cand >= dt:
-            return cand
-    # иначе — завтра в первый час из списка
-    return (base + timedelta(days=1)).replace(hour=HOURS[0])
-
-async def notify_admins(bot: Bot, text: str) -> None:
-    if not ADMINS:
-        return
-    for uid in ADMINS:
-        try:
-            await bot.send_message(uid, text, disable_web_page_preview=True)
-        except Exception as e:
-            log.warning(f"notify_admins fail for {uid}: {e}")
-
-async def send_to_channel(bot: Bot, text: str) -> None:
-    await bot.send_message(chat_id=CHANNEL_ID, text=text, disable_web_page_preview=True)
-
-# ----------------- Основная работа -----------------
-async def do_one_post(bot: Bot) -> None:
-    """Берём самое старое, показываем превью админам, постим, чистим похожие, шлём отчёт."""
+async def run_scheduler():
     await init_db()
-
-    row = await get_oldest()
-    if not row:
-        await notify_admins(bot, "⚠️ Очередь пустая — постить нечего.")
-        log.info("Очередь пустая.")
-        return
-
-    ad_id = row["id"] if isinstance(row, dict) else row[0]
-    ad_text = row["text"] if isinstance(row, dict) else row[1]
-
-    # Превью админам
-    preview = (
-        "📝 <b>Предстоящий пост</b>\n\n"
-        f"{ad_text}\n\n"
-        f"ID в очереди: <code>{ad_id}</code>"
-    )
-    await notify_admins(bot, preview)
-
-    # Пост в канал
-    await send_to_channel(bot, ad_text)
-
-    # Поиск и удаление похожих
-    similar_ids = await find_similar_ids(ad_id)  # список int (может быть пуст)
-    removed = 0
-    if similar_ids:
-        ids = set(similar_ids)
-        ids.add(ad_id)
-        removed = await bulk_delete(list(ids))
-    else:
-        await delete_by_id(ad_id)
-        removed = 1
-
-    # Итоговый отчёт
-    report = (
-        "✅ <b>Опубликовано</b>\n"
-        f"Удалено похожих (включая исходный): <b>{removed}</b>"
-    )
-    await notify_admins(bot, report)
-    log.info(f"Опубликовано и удалено {removed} записей.")
-
-async def run_scheduler() -> None:
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    log.info(f"Scheduler TZ={TZ_NAME}, times={','.join(map(str, HOURS))}")
-
-    # бесконечный цикл по расписанию
+    log.info("Scheduler  TZ=%s, times=%s, preview_before=%s min", TZ, SCHEDULE_TIMES, PREVIEW_BEFORE_MINUTES)
     while True:
-        now_dt = now()
-        run_dt = next_run_after(now_dt)
-        wait_sec = max((run_dt - now_dt).total_seconds(), 0)
-        log.info(f"Следующий пост через {wait_sec/3600:.2f} часов ({human_dt(run_dt)})")
-        try:
-            await asyncio.sleep(wait_sec)
-            await do_one_post(bot)
-        except Exception as e:
-            log.exception(f"Ошибка при выполнении поста: {e}")
-            # чтобы не улететь в быстрый цикл при постоянной ошибке
-            await asyncio.sleep(10)
+        now = _tznow()
+        next_run = _next_run_after(now)
+        run_ts = int(next_run.timestamp())
+        preview_delta = timedelta(minutes=max(PREVIEW_BEFORE_MINUTES, 0))
+        preview_moment = next_run - preview_delta
+
+        # 1) если до превью есть время — спим
+        if now < preview_moment:
+            to_sleep = (preview_moment - now).total_seconds()
+            log.info("Следующий ПРЕВЬЮ через %.2f часов (%s)", to_sleep / 3600, preview_moment)
+            await asyncio.sleep(to_sleep)
+
+        # 2) отправляем превью (если есть что постить)
+        ad = get_oldest()
+        if ad:
+            ad_id, text = ad
+            await _send_preview(run_ts, ad_id, text)
+        else:
+            await _notify_admins("ℹ️ Очередь пуста: публиковать нечего.")
+
+        # 3) ждём до фактического времени поста
+        now2 = _tznow()
+        if now2 < next_run:
+            await asyncio.sleep((next_run - now2).total_seconds())
+
+        # 4) в момент X проверяем, не отменили ли
+        if ad:
+            ad_id, text = ad
+            token = _mk_token(run_ts, ad_id)
+            plan = plan_get(token)
+            if plan and plan["status"] == "cancelled":
+                await _notify_admins(
+                    f"⏭️ Публикация пропущена по отмене (token <code>{token}</code>, ad_id={ad_id})."
+                )
+            else:
+                await _post_to_channel(ad_id, text)
+
+        # 5) чистим старые план-записи и идём искать следующий слот
+        plan_clear_old(int(time.time()))
 
 async def main():
     await run_scheduler()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Scheduler stopped")
+    asyncio.run(main())
