@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -43,17 +43,17 @@ def is_admin(uid: Optional[int]) -> bool:
 
 def unify_caption(text: str | None) -> str:
     """
-    Приводим подпись к единому формату.
+    Приводим подпись к единому формату (как договаривались).
     """
     text = (text or "").strip()
-    # косметика тире/пробелов
+    # косметика тире/пробелов/пустых строк
     text = text.replace("Цена -", "Цена —")
-    text = text.replace("  ", " ")
-    # убрать пустые строки
+    while "  " in text:
+        text = text.replace("  ", " ")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     text = "\n".join(lines)
     # добавить контакт, если нет
-    if "layoutplacebuy" not in text:
+    if "layoutplacebuy" not in text.lower():
         text += "\n\n@layoutplacebuy"
     return text
 
@@ -61,56 +61,96 @@ props = DefaultBotProperties(parse_mode=ParseMode.HTML, disable_web_page_preview
 bot = Bot(BOT_TOKEN, default=props)
 dp = Dispatcher(storage=MemoryStorage())
 
-# ---------------- КЭШ АЛЬБОМОВ (последний альбом, который админ переслал боту) ----------------
-# Храним ПОСЛЕДНИЙ альбом от каждого админа:
-# { admin_id: {"media_group_id": int, "source_chat_id": int, "message_ids": [int,...], "caption": str, "ts": int } }
-ALBUM_CACHE: Dict[int, Dict[str, Any]] = {}
+# ---------------- АВТО-Альбомы: кэш + дебаунс ----------------
+# Накапливаем части альбома по media_group_id и авто-добавляем через DEBOUNCE_SEC после последней части
+DEBOUNCE_SEC = 2.0
 
-def _touch_album(user_id: int, media_group_id: str, source_chat_id: int, forward_msg_id: int, caption: Optional[str]):
-    rec = ALBUM_CACHE.get(user_id)
-    if rec and str(rec.get("media_group_id")) == str(media_group_id):
-        # тот же альбом — дополняем
-        if forward_msg_id not in rec["message_ids"]:
-            rec["message_ids"].append(forward_msg_id)
-        if (not rec.get("caption")) and caption:
-            rec["caption"] = caption
-        rec["ts"] = int(time.time())
-    else:
-        # новый альбом
-        ALBUM_CACHE[user_id] = {
-            "media_group_id": str(media_group_id),
-            "source_chat_id": int(source_chat_id),
-            "message_ids": [int(forward_msg_id)],
-            "caption": caption or "",
-            "ts": int(time.time()),
-        }
+# { admin_id: { mgid: {"source_chat_id": int, "ids": set[int], "caption": str, "last_ts": int} } }
+ALBUM_CACHE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+# таймеры завершения сбора: { (admin_id, mgid): asyncio.Task }
+ALBUM_TIMERS: Dict[tuple, asyncio.Task] = {}
 
-def _get_latest_album(user_id: int) -> Optional[Dict[str, Any]]:
-    return ALBUM_CACHE.get(user_id)
+def _album_cache_get(user_id: int, mgid: str) -> Optional[Dict[str, Any]]:
+    return ALBUM_CACHE.get(user_id, {}).get(mgid)
 
-def _clear_album(user_id: int):
-    ALBUM_CACHE.pop(user_id, None)
+def _album_cache_touch(user_id: int, mgid: str, source_chat_id: int, fwd_mid: int, caption: Optional[str]):
+    u = ALBUM_CACHE.setdefault(user_id, {})
+    rec = u.get(mgid)
+    if not rec:
+        rec = {"source_chat_id": int(source_chat_id), "ids": set(), "caption": "", "last_ts": 0}
+        u[mgid] = rec
+    rec["ids"].add(int(fwd_mid))
+    if caption and not rec["caption"]:
+        rec["caption"] = caption
+    rec["last_ts"] = int(time.time())
+
+def _album_cache_pop(user_id: int, mgid: str) -> Optional[Dict[str, Any]]:
+    u = ALBUM_CACHE.get(user_id)
+    if not u:
+        return None
+    return u.pop(mgid, None)
+
+def _cancel_timer(user_id: int, mgid: str):
+    key = (user_id, mgid)
+    t = ALBUM_TIMERS.pop(key, None)
+    if t and not t.done():
+        t.cancel()
+
+async def _finalize_album(user_id: int, mgid: str):
+    """
+    Вызывается по таймеру через DEBOUNCE_SEC после последней части альбома.
+    Формирует очередь перепоста автоматически.
+    """
+    rec = _album_cache_pop(user_id, mgid)
+    if not rec:
+        return
+    ids_sorted: List[int] = sorted(rec["ids"])
+    qid = queue_add(
+        source_chat_id=int(rec["source_chat_id"]),
+        message_ids=ids_sorted,
+        caption_override=unify_caption(rec.get("caption") or "")
+    )
+    # уведомим админа
+    try:
+        await bot.send_message(
+            chat_id=user_id,
+            text=(f"✅ Альбом автоматически добавлен в очередь копирования: <code>{qid}</code>\n"
+                  f"Элементов: <b>{len(ids_sorted)}</b>")
+        )
+    except Exception:
+        pass
+
+def _debounce_album_finalize(user_id: int, mgid: str):
+    """
+    Сбрасываем (перезапускаем) таймер завершения сбора для конкретного альбома.
+    """
+    _cancel_timer(user_id, mgid)
+    async def _task():
+        await asyncio.sleep(DEBOUNCE_SEC)
+        await _finalize_album(user_id, mgid)
+    t = asyncio.create_task(_task())
+    ALBUM_TIMERS[(user_id, mgid)] = t
 
 # ---------------- Хэндлер: ловим пересланные сообщения с фото/медиагруппой ----------------
 @dp.message(F.forward_from_chat & F.media_group_id)
 async def on_forwarded_album_piece(m: Message):
     """
     Админ пересылает элементы альбома из канала боту.
-    Мы собираем forward_from_message_id по media_group_id.
+    Мы накапливаем forward_from_message_id по media_group_id.
+    После паузы DEBOUNCE_SEC авто-добавляем альбом в очередь.
     """
     if not is_admin(m.from_user.id):
         return
     try:
-        source_chat_id = m.forward_from_chat.id  # исходный канал
-        fwd_mid = m.forward_from_message_id      # message_id в исходном канале
-        mgid = m.media_group_id                  # общий media_group_id (сохраняется при forward)
+        source_chat_id = m.forward_from_chat.id          # исходный канал
+        fwd_mid = m.forward_from_message_id              # message_id в исходном канале
+        mgid = str(m.media_group_id)                     # общий media_group_id (сохраняется при forward)
         caption = m.caption or m.text or ""
         if source_chat_id and fwd_mid and mgid:
-            _touch_album(m.from_user.id, str(mgid), int(source_chat_id), int(fwd_mid), caption)
+            _album_cache_touch(m.from_user.id, mgid, int(source_chat_id), int(fwd_mid), caption)
+            _debounce_album_finalize(m.from_user.id, mgid)
     except Exception as e:
         log.exception("Ошибка сбора альбома: %s", e)
-
-# На случай одиночной пересылки фото без media_group_id — пусть добавляют через /add_post (уже было)
 
 # ---------------- Базовые команды ----------------
 @dp.message(Command("start"))
@@ -119,13 +159,13 @@ async def cmd_start(m: Message):
         "Готов к работе.\n\n"
         "<b>Команды</b>:\n"
         "/myid — показать твой Telegram ID\n"
-        "/enqueue &lt;текст&gt; — положить текстовое объявление в очередь (старый режим)\n"
+        "/enqueue &lt;текст&gt; — положить <i>текстовое</i> объявление в очередь (старый режим)\n"
         "/queue — показать размер очередей\n"
         "/post_oldest — опубликовать самое старое (старый режим)\n"
-        "/add_post &lt;ссылка-на-сообщение&gt; — добавить одиночный пост из канала в очередь копий\n"
-        "/add_album — добавить ПОСЛЕДНИЙ пересланный альбом (forward из канала) в очередь копий\n"
-        "/clear_album — очистить сохранённый альбом\n"
-        "/now — текущее время (TZ)\n"
+        "/add_post &lt;ссылка-на-сообщение&gt; — добавить <i>одиночный</i> пост из канала в очередь копий\n"
+        "/clear_albums_cache — очистить буфер альбомов\n"
+        "/now — текущее время (TZ)\n\n"
+        "💡 Альбомы теперь добавляются <b>автоматически</b>: просто перешли боту <u>все фото альбома</u> из канала подряд."
     )
     await m.answer(help_text)
 
@@ -136,6 +176,19 @@ async def cmd_myid(m: Message):
 @dp.message(Command("now"))
 async def cmd_now(m: Message):
     await m.answer(f"Серверное время: <b>{now_str()}</b> ({TZ_NAME})")
+
+@dp.message(Command("clear_albums_cache"))
+async def cmd_clear_cache(m: Message):
+    if not is_admin(m.from_user.id):
+        return await m.answer("Нет прав.")
+    ALBUM_CACHE.pop(m.from_user.id, None)
+    # отменим все таймеры конкретного админа
+    to_cancel = [k for k in list(ALBUM_TIMERS.keys()) if k[0] == m.from_user.id]
+    for key in to_cancel:
+        t = ALBUM_TIMERS.pop(key, None)
+        if t and not t.done():
+            t.cancel()
+    await m.answer("Буфер альбомов для тебя очищен.")
 
 # --------- Старый текстовый режим (оставляем для совместимости) ---------
 @dp.message(Command("enqueue"))
@@ -175,7 +228,7 @@ async def cmd_post_oldest(m: Message):
         f"Удалено из очереди объявлений: <b>{removed}</b> (включая похожие)."
     )
 
-# ---------------- Новые команды: добавление одиночного поста и альбома ----------------
+# ---------------- Новая команда: добавление одиночного поста по ссылке или реплаю ----------------
 def _parse_link(arg: str):
     """
     Поддерживает:
@@ -213,12 +266,16 @@ async def cmd_add_post(m: Message, command: CommandObject):
     if m.reply_to_message and m.reply_to_message.forward_from_chat:
         rm = m.reply_to_message
         if rm.media_group_id:
-            return await m.answer("Это часть альбома. Для альбомов используй: /add_album")
+            return await m.answer("Это часть альбома. Просто перешли ВСЕ фото — бот добавит альбом сам.")
         source_chat_id = rm.forward_from_chat.id
         fwd_mid = rm.forward_from_message_id
         if not fwd_mid:
             return await m.answer("Не вижу forward_from_message_id. Перешли сообщение из канала ещё раз.")
-        qid = queue_add(source_chat_id=source_chat_id, message_ids=[fwd_mid], caption_override=unify_caption(rm.caption or rm.text or ""))
+        qid = queue_add(
+            source_chat_id=source_chat_id,
+            message_ids=[int(fwd_mid)],
+            caption_override=unify_caption(rm.caption or rm.text or "")
+        )
         return await m.answer(f"Добавлено в очередь копирования: <code>{qid}</code>")
 
     # Вариант 2: по ссылке
@@ -228,43 +285,14 @@ async def cmd_add_post(m: Message, command: CommandObject):
             "Использование:\n"
             "• Ответом на пересланное сообщение из канала: <code>/add_post</code>\n"
             "• Или: <code>/add_post https://t.me/username/123</code>\n"
-            "     или <code>/add_post https://t.me/c/123456789/123</code>"
+            "     или <code>/add_post https://t.me/c/123456789/123</code>\n\n"
+            "💡 Для альбомов — просто перешли все фото, бот добавит сам."
         )
     source_chat, mids = parsed
-    qid = queue_add(source_chat_id=source_chat if isinstance(source_chat, int) else source_chat, message_ids=mids, caption_override=None)
+    qid = queue_add(source_chat_id=source_chat if isinstance(source_chat, int) else source_chat,
+                    message_ids=[int(x) for x in mids],
+                    caption_override=None)
     await m.answer(f"Добавлено в очередь копирования: <code>{qid}</code>")
-
-@dp.message(Command("add_album"))
-async def cmd_add_album(m: Message):
-    """
-    Процедура:
-      1) Перешли ВСЕ фото альбома из канала боту (как forward).
-      2) Пришли /add_album — мы возьмём последний собранный альбом от тебя.
-    """
-    if not is_admin(m.from_user.id):
-        return await m.answer("Нет прав.")
-
-    rec = _get_latest_album(m.from_user.id)
-    if not rec:
-        return await m.answer("Не найден недавний альбом. Сначала перешли альбом из канала, затем повтори /add_album.")
-
-    # сортируем ids на всякий случай
-    ids = sorted(set(int(x) for x in rec["message_ids"]))
-    qid = queue_add(
-        source_chat_id=int(rec["source_chat_id"]),
-        message_ids=ids,
-        caption_override=unify_caption(rec.get("caption") or "")
-    )
-    _clear_album(m.from_user.id)
-    await m.answer(f"✅ Альбом добавлен в очередь копирования: <code>{qid}</code>\n"
-                   f"Элементов: <b>{len(ids)}</b>")
-
-@dp.message(Command("clear_album"))
-async def cmd_clear_album(m: Message):
-    if not is_admin(m.from_user.id):
-        return await m.answer("Нет прав.")
-    _clear_album(m.from_user.id)
-    await m.answer("Кэш последнего альбома очищен.")
 
 # ---------------- Точка входа ----------------
 async def main():
