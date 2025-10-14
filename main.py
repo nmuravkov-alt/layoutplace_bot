@@ -148,12 +148,14 @@ async def cmd_post_oldest(m: Message):
         f"Удалено из очереди объявлений: <b>{removed}</b> (включая похожие)."
     )
 
-# -------------------- Точка входа ----------------------------
+
+# ==================== Точка входа ====================
 
 async def main():
-    init_db()
+    await init_db()
     log.info("✅ Бот запущен для @%s (TZ=%s)", CHANNEL_ID.strip("@"), TZ)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
