@@ -6,12 +6,12 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from html import escape as html_escape
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
 from aiogram.exceptions import TelegramBadRequest
 
 from storage.db import (
@@ -42,8 +42,13 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 # ---------------- Утилиты ----------------
-def _is_admin(m: Message) -> bool:
-    return bool(m.from_user and m.from_user.id in ADMINS)
+def _is_admin(m: Message | CallbackQuery) -> bool:
+    uid = None
+    if isinstance(m, Message):
+        uid = m.from_user.id if m.from_user else None
+    else:
+        uid = m.from_user.id if m.from_user else None
+    return bool(uid and uid in ADMINS)
 
 def _now_str() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -73,7 +78,8 @@ async def cmd_start(m: Message):
         "/queue_list [N] — показать N ближайших к публикации (по умолчанию 10)\n"
         "/delete &lt;id&gt; — удалить объявление по ID\n"
         "/post_oldest — опубликовать самое старое и удалить похожие\n"
-        "/now — текущее время сервера\n"
+        "/now — текущее время сервера\n\n"
+        "В превью перед постом есть кнопка «Опубликовать сейчас»."
     )
     await m.answer(help_text)
 
@@ -115,7 +121,6 @@ async def cmd_queue(m: Message):
 async def cmd_queue_list(m: Message, command: CommandObject):
     if not _is_admin(m):
         return await m.answer("Нет прав.")
-    # парсим N
     try:
         n = int((command.args or "").strip() or "10")
         n = max(1, min(50, n))
@@ -124,7 +129,6 @@ async def cmd_queue_list(m: Message, command: CommandObject):
     items = db_list_queue(n)
     if not items:
         return await m.answer("Очередь пуста.")
-    # отрисуем компактно
     lines = []
     for ad_id, text, created_at in items:
         when = datetime.fromtimestamp(created_at, tz).strftime("%d.%m %H:%M")
@@ -155,28 +159,53 @@ async def cmd_post_oldest(m: Message):
         return await m.answer("Очередь пуста.")
     ad_id, text = row
 
-    # пост в канал
     await safe_send_channel(text)
 
-    # чистка похожих (включая исходный)
     similar = find_similar_ids(ad_id, threshold=0.88)
     removed = bulk_delete([ad_id] + similar)
 
-    # отчёт админам
     now_h = _now_str()
     await _notify_admins(
         f"✅ Опубликовано ({now_h}). ID: <code>{ad_id}</code>. "
         f"Удалено похожих (включая исходный): <b>{removed}</b>."
     )
-
-    # опционально — служебный лог в канал
     if POST_REPORT_TO_CHANNEL:
         await safe_send_channel(f"ℹ️ Пост опубликован. ID: {ad_id}. Удалено похожих: {removed}.")
 
-    await m.answer(
-        "✅ Опубликовано в канал.\n"
-        f"🗑 Удалено (вместе с похожими): <b>{removed}</b>"
+    await m.answer("✅ Опубликовано в канал.\n" f"🗑 Удалено (вместе с похожими): <b>{removed}</b>")
+
+# ---------------- Кнопка «Опубликовать сейчас» из превью ----------------
+@dp.callback_query(F.data == "postnow")
+async def cb_postnow(q: CallbackQuery):
+    if not _is_admin(q):
+        return await q.answer("Нет прав.", show_alert=True)
+
+    row = get_oldest()
+    if not row:
+        await q.answer("Очередь пуста.", show_alert=True)
+        return
+    ad_id, text = row
+
+    # постим
+    await safe_send_channel(text)
+    similar = find_similar_ids(ad_id, threshold=0.88)
+    removed = bulk_delete([ad_id] + similar)
+
+    # уведомления
+    now_h = _now_str()
+    await _notify_admins(
+        f"✅ Опубликовано по кнопке «Опубликовать сейчас» ({now_h}). "
+        f"ID: <code>{ad_id}</code>. Удалено похожих: <b>{removed}</b>."
     )
+    if POST_REPORT_TO_CHANNEL:
+        await safe_send_channel(f"ℹ️ Пост опубликован. ID: {ad_id}. Удалено похожих: {removed}.")
+
+    # убираем кнопки под превью
+    try:
+        await q.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await q.answer("Опубликовано.", show_alert=False)
 
 # ---------------- Точка входа ----------------
 async def main():
