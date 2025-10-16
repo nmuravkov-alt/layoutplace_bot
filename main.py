@@ -54,7 +54,7 @@ def normalize_caption(raw: str) -> str:
     return text
 
 async def say_plain(m: Message, text: str):
-    """Отправить подсказку без HTML/Markdown (чтобы не ловить 'Unsupported start tag')."""
+    """Отправить подсказку/хелп без HTML/Markdown (чтобы не ловить 'Unsupported start tag')."""
     await m.answer(text, parse_mode=None, disable_web_page_preview=True)
 
 # ===== кэш альбомов (по media_group_id) =====
@@ -109,9 +109,11 @@ async def cmd_start(m: Message):
         "/queue — показать размер очереди\n"
         "/post_oldest — опубликовать самый старый пост вручную\n"
         "/clear_queue — очистить очередь\n"
-        "/test_preview — проверить превью админу\n"
+        "/test_preview — проверить превью админу\n\n"
+        "Подсказка: угловые скобки <...> в примерах — это просто обозначение, вводи свой текст без них."
     )
-    await m.answer(help_text, disable_web_page_preview=True)
+    # отправляем ХЕЛП БЕЗ parse_mode, чтобы <текст> не парсился как HTML-тег
+    await say_plain(m, help_text)
 
 @dp.message(Command("enqueue"))
 async def cmd_enqueue(m: Message, command: CommandObject):
