@@ -4,23 +4,16 @@ import inspect
 
 from main import bot, dp
 try:
-    # если в main уже экспортируется init_db
-    from main import init_db  # type: ignore
+    from main import init_db  # если экспортируешь из main
 except ImportError:
-    # иначе берём напрямую из хранилища
-    from storage.db import init_db  # type: ignore
-
+    from storage.db import init_db  # иначе берём из storage.db
 
 async def _startup():
-    # Инициализация БД (создаст таблицы, включая queue)
     if inspect.iscoroutinefunction(init_db):
         await init_db()
     else:
-        init_db()  # type: ignore
-
-    # Запуск бота
+        init_db()
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     print("Starting bot instance...")
