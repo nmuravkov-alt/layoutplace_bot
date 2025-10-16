@@ -2,6 +2,18 @@
 import asyncio
 import logging
 import time
+import os, sys
+
+# ---- single-instance guard (чтобы не было второго инстанса) ----
+try:
+    import fcntl
+    _lock_file = open('/tmp/layoutplace_bot.lock', 'w')
+    fcntl.lockf(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except Exception:
+    print("Another instance of layoutplace_bot is already running; exiting.")
+    sys.exit(0)
+# ---------------------------------------------------------------
+
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
@@ -12,6 +24,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
+
 
 # ---- конфиг ----
 from config import (
