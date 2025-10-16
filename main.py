@@ -224,7 +224,7 @@ async def cmd_add_post(m: Message):
 
     await m.answer(f"Медиа добавлено в очередь (id={item_id}). В очереди: {get_count()}.")
 
-@dp.message(Command("queue")))
+@dp.message(Command("queue"))
 async def cmd_queue(m: Message):
     if not is_admin(m.from_user.id):
         return await say_plain(m, "Команда доступна только админам.")
