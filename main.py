@@ -219,6 +219,84 @@ async def cmd_test_preview(message: types.Message):
         await message.answer("🔔 Уведомление успешно отправлено всем админам.")
     else:
         await message.answer("❌ Не удалось отправить уведомления.")
+        
+        # ---------- Импорт последних N постов из канала в очередь ----------
+
+from aiogram.types import Message
+from aiogram.filters import Command, CommandObject
+
+MAX_BULK_IMPORT = 500  # защита от слишком больших выборок
+
+
+def _channel_slug() -> str:
+    """
+    Превращаем CHANNEL_ID из вида '@layoutplace' -> 'layoutplace'
+    (нужно для формирования t.me ссылки).
+    """
+    cid = str(CHANNEL_ID)
+    return cid[1:] if cid.startswith("@") else cid
+
+
+@dp.message(Command("import_from"))
+async def cmd_import_from(m: Message, command: CommandObject):
+    """
+    /import_from <N>
+    Добавляет в очередь ссылки на последние N сообщений канала.
+    Ссылки в очереди потом обрабатываются планировщиком как перепост с удалением оригинала.
+    """
+    # доступ только админам
+    if str(m.from_user.id) not in ADMINS:
+        return
+
+    # разбор аргумента
+    n = 0
+    if command.args:
+        try:
+            n = int(command.args.strip())
+        except Exception:
+            pass
+    if n <= 0:
+        await m.answer("Использование: <code>/import_from N</code>\nНапример: <code>/import_from 50</code>", disable_web_page_preview=True)
+        return
+
+    # ограничим диапазон
+    n = min(MAX_BULK_IMPORT, max(1, n))
+
+    await m.answer(f"Начинаю импорт последних <b>{n}</b> сообщений из канала…")
+
+    # 1) Получаем «верхний» message_id: отправим и сразу удалим пробное сообщение в канал
+    try:
+        probe = await bot.send_message(CHANNEL_ID, "🔎 sync", disable_notification=True)
+        last_id = probe.message_id
+        # удаляем служебное
+        try:
+            await bot.delete_message(CHANNEL_ID, last_id)
+        except Exception:
+            pass
+    except Exception as e:
+        await m.answer(f"Не удалось получить верхний message_id канала. Убедись, что бот — админ.\nОшибка: <code>{e}</code>")
+        return
+
+    slug = _channel_slug()
+    start_id = max(1, last_id - n)     # включительно
+    end_id = last_id - 1               # включительно (сам probe мы удалили)
+
+    added = 0
+    for mid in range(end_id, start_id - 1, -1):
+        link = f"https://t.me/{slug}/{mid}"
+        # Кладём в очередь как ссылку. Планировщик уже умеет разруливать такие элементы.
+        try:
+            db_enqueue(link)
+            added += 1
+        except Exception:
+            # пропускаем проблемные id (напр. системные/удалённые сообщения)
+            continue
+
+    await m.answer(
+        f"Готово ✅ В очередь добавлено <b>{added}</b> ссылок "
+        f"(просмотрено диапазон message_id: {start_id}…{end_id})."
+    )
+
 
 # ---------------- Точка входа ----------------
 async def main():
