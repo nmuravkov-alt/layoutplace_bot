@@ -3,11 +3,14 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
+from typing import Dict, List
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
 from config import TOKEN as BOT_TOKEN, TZ as TZ_NAME, ADMINS, CHANNEL_ID
+from storage.db import init_db, get_oldest, get_count, delete_by_id
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -17,51 +20,62 @@ log = logging.getLogger("scheduler")
 
 TZ = ZoneInfo(TZ_NAME or "Europe/Moscow")
 
-# Расписание постинга: 12:00 / 16:00 / 20:00 (локально для TZ)
 SLOTS = [dtime(12, 0), dtime(16, 0), dtime(20, 0)]
 PREVIEW_BEFORE_MIN = 45
-
 
 def _now() -> datetime:
     return datetime.now(tz=TZ)
 
-
 def _next_slot(now: datetime) -> datetime:
-    """Вернёт ближайшее время постинга в пределах сегодня/завтра."""
     today = now.date()
     candidates = [datetime.combine(today, t, tzinfo=TZ) for t in SLOTS]
     for dt in candidates:
         if dt > now:
             return dt
-    # если все прошли — первый слот завтра
+    # иначе — первый слот завтра
     tomorrow = today + timedelta(days=1)
     return datetime.combine(tomorrow, SLOTS[0], tzinfo=TZ)
 
-
 async def _notify_admins(bot: Bot, text: str) -> None:
-    """Отправка служебного сообщения админам в ЛС.
-    Работает только если админ нажал /start боту (иначе Unauthorized)."""
     for aid in ADMINS:
         try:
-            await bot.send_message(
-                aid,
-                text,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-            )
+            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as e:
-            # Обычно это TelegramUnauthorizedError: админ не нажал /start
             log.warning("Админ %s недоступен (%s). Нажми /start боту в ЛС.", aid, type(e).__name__)
 
+async def _post_item(bot: Bot, item: Dict):
+    text = item["text"]
+    media = item["media"]
+
+    if not media:
+        await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
+    else:
+        ims = []
+        for i, it in enumerate(media):
+            t = it["type"]
+            fid = it["file_id"]
+            if t == "photo":
+                ims.append(InputMediaPhoto(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+            elif t == "video":
+                ims.append(InputMediaVideo(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+            elif t == "document":
+                ims.append(InputMediaDocument(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+        await bot.send_media_group(CHANNEL_ID, ims)
+
+    # удалить исходники (если знаем)
+    if item.get("src_chat_id") and item.get("src_msg_ids"):
+        for mid in item["src_msg_ids"]:
+            try:
+                await bot.delete_message(item["src_chat_id"], mid)
+            except Exception as e:
+                log.warning("Не смог удалить старое сообщение %s: %s", mid, e)
 
 async def run_scheduler():
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=None,  # никаких устаревших аргументов здесь
-    )
+    init_db()
+    bot = Bot(BOT_TOKEN)
 
     log.info(
-        "Scheduler  TZ=%s, times=%s, preview_before=%d min",
+        "Scheduler TZ=%s, times=%s, preview_before=%d min",
         TZ.key,
         ",".join(t.strftime("%H:%M") for t in SLOTS),
         PREVIEW_BEFORE_MIN,
@@ -72,61 +86,47 @@ async def run_scheduler():
         slot = _next_slot(now)
         preview_at = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
 
-        # Информируем, что запущены и когда следующий слот/превью
+        # Сообщим ближайшие времена
         await _notify_admins(
             bot,
             (
-                f"⏰ <b>Планировщик на связи</b>\n"
-                f"Канал: <code>{CHANNEL_ID}</code>\n"
-                f"Часовой пояс: <code>{TZ.key}</code>\n\n"
-                f"Следующий слот постинга: <b>{slot:%Y-%m-%d %H:%M}</b>\n"
-                f"Превью в: <b>{preview_at:%Y-%m-%d %H:%M}</b>"
+                f"Планировщик активен.\n"
+                f"Следующий слот: <b>{slot:%Y-%m-%d %H:%M}</b> ({TZ.key})\n"
+                f"Превью в: <b>{preview_at:%Y-%m-%d %H:%M}</b>\n"
+                f"В очереди сейчас: <b>{get_count()}</b>."
             ),
         )
 
-        # Ждём времени превью
+        # Ждём превью
         now = _now()
         if preview_at > now:
-            sleep_sec = (preview_at - now).total_seconds()
-            log.info("Ждём превью %.2f секунд (до %s)", sleep_sec, preview_at)
-            await asyncio.sleep(sleep_sec)
+            await asyncio.sleep((preview_at - now).total_seconds())
 
-        # Превью админам (сам текст поста формирует бот при публикации —
-        # тут лишь напоминание, что через 45 минут запостим)
-        await _notify_admins(
-            bot,
-            (
-                "🔔 <b>Превью</b>\n"
-                f"До постинга осталось <b>{PREVIEW_BEFORE_MIN} минут</b>."
-            ),
-        )
+        await _notify_admins(bot, f"Предупреждение: до постинга <b>{PREVIEW_BEFORE_MIN} минут</b>. В очереди: <b>{get_count()}</b>.")
 
-        # Ждём до самого слота
+        # Ждём сам слот
         now = _now()
         if slot > now:
-            sleep_sec = (slot - now).total_seconds()
-            log.info("Ждём слот постинга %.2f секунд (до %s)", sleep_sec, slot)
-            await asyncio.sleep(sleep_sec)
+            await asyncio.sleep((slot - now).total_seconds())
 
-        # На самом слоте мы не публикуем сами — публикацию делает ваш основной бот
-        # (он берёт самый старый пост/репост из очереди).
-        # Здесь просто пингуем админов, что «пора».
-        await _notify_admins(
-            bot,
-            "🚀 Время постинга. Бот опубликует следующий элемент очереди.",
-        )
+        # Публикуем один самый старый элемент
+        rows = get_oldest(1)
+        if not rows:
+            await _notify_admins(bot, "Очередь пуста — публиковать нечего.")
+        else:
+            item = rows[0]
+            try:
+                await _post_item(bot, item)
+                delete_by_id(item["id"])
+                await _notify_admins(bot, f"✅ Опубликовано. В очереди осталось: <b>{get_count()}</b>.")
+            except Exception as e:
+                await _notify_admins(bot, f"❌ Ошибка публикации: <code>{e}</code>")
 
-        # Переходим к поиску следующего слота (цикл while True)
-        # Защита от плотной итерации:
+        # Микропаузa, чтобы не уйти в tight loop
         await asyncio.sleep(1)
 
-
 async def main():
-    try:
-        await run_scheduler()
-    except asyncio.CancelledError:
-        pass
-
+    await run_scheduler()
 
 if __name__ == "__main__":
     asyncio.run(main())
