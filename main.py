@@ -1,6 +1,7 @@
 # main.py
 import asyncio
 import logging
+import re
 from typing import Dict, List, Optional
 
 from aiogram import Bot, Dispatcher, F, types
@@ -41,20 +42,61 @@ dp = Dispatcher(storage=MemoryStorage())
 def is_admin(uid: int) -> bool:
     return uid in ADMINS
 
+def _strip_inline_hashtags(s: str) -> str:
+    # убираем #теги внутри строки
+    return re.sub(r'(?:^|\s)#\w+', lambda m: ' ' if m.group(0).startswith(' ') else '', s).strip()
+
 def normalize_caption(raw: str) -> str:
-    raw = (raw or "").strip()
-    # убираем пустые строки в середине
-    lines = [l.strip() for l in raw.splitlines() if l.strip()]
-    text = "\n".join(lines)
-    text += (
-        "\n\n"
-        f"Общий альбом: {ALBUM_URL}\n"
-        f"Покупка/вопросы: {CONTACT_TEXT}"
-    )
-    return text
+    """
+    Приводит подпись к единому стилю:
+    - удаляет строки с хештегами, старыми ссылками/контактами, упоминания @layoutplacebuy
+    - вырезает любые URL
+    - чистит инлайновые #теги
+    - добавляет наш блок с альбомом и контактом
+    """
+    text = (raw or "")
+
+    # разложим на строки, отфильтруем "мусорные"
+    lines = [l.strip() for l in text.splitlines()]
+    kept: List[str] = []
+    for l in lines:
+        if not l:
+            continue
+        low = l.lower()
+
+        # целиком строка-хештеги?
+        if l.startswith("#"):
+            continue
+
+        # упоминание нашего контакта
+        if "@layoutplacebuy" in low:
+            continue
+
+        # стандартные “хвосты”
+        if "общий альбом" in low or "общее наличие" in low or "общие наличие" in low:
+            continue
+        if "покупка" in low and "вопрос" in low:
+            continue
+
+        # есть URL — вырежем целую строку, чтобы не тащить старые ссылки
+        if re.search(r'https?://\S+', l):
+            continue
+
+        # уберём инлайновые #теги и лишние пробелы
+        clean = _strip_inline_hashtags(l)
+        clean = re.sub(r'\s{2,}', ' ', clean).strip()
+        if clean:
+            kept.append(clean)
+
+    normalized = "\n".join(kept).strip()
+
+    # добавляем наш единый хвост
+    tail = f"Общий альбом: {ALBUM_URL}\nПокупка/вопросы: {CONTACT_TEXT}"
+    normalized = (normalized + "\n\n" if normalized else "") + tail
+    return normalized
 
 async def say_plain(m: Message, text: str):
-    """Отправить подсказку/хелп без HTML/Markdown (чтобы не ловить 'Unsupported start tag')."""
+    """Отправить подсказку/хелп без HTML/Markdown (чтобы <текст> не парсился как тег)."""
     await m.answer(text, parse_mode=None, disable_web_page_preview=True)
 
 # ===== кэш альбомов (по media_group_id) =====
@@ -112,7 +154,6 @@ async def cmd_start(m: Message):
         "/test_preview — проверить превью админу\n\n"
         "Подсказка: угловые скобки <...> в примерах — это просто обозначение, вводи свой текст без них."
     )
-    # отправляем ХЕЛП БЕЗ parse_mode, чтобы <текст> не парсился как HTML-тег
     await say_plain(m, help_text)
 
 @dp.message(Command("enqueue"))
@@ -183,7 +224,7 @@ async def cmd_add_post(m: Message):
 
     await m.answer(f"Медиа добавлено в очередь (id={item_id}). В очереди: {get_count()}.")
 
-@dp.message(Command("queue"))
+@dp.message(Command("queue")))
 async def cmd_queue(m: Message):
     if not is_admin(m.from_user.id):
         return await say_plain(m, "Команда доступна только админам.")
@@ -245,7 +286,6 @@ async def cmd_post_oldest(m: Message):
 async def cmd_test_preview(m: Message):
     if not is_admin(m.from_user.id):
         return await say_plain(m, "Команда доступна только админам.")
-    from config import ADMINS
     text = "<b>Тестовое превью</b>\nПост был бы тут за 45 минут до публикации."
     for aid in ADMINS:
         try:
