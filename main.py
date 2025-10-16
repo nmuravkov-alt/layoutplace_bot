@@ -10,7 +10,14 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
-from config import TOKEN as BOT_TOKEN, CHANNEL_ID as _CHANNEL_ID, TZ as _TZ, ALBUM_URL, CONTACT_TEXT
+from config import (
+    TOKEN as BOT_TOKEN,
+    CHANNEL_ID as _CHANNEL_ID,   # @username или -100...
+    TZ as _TZ,
+    ALBUM_URL,
+    CONTACT_TEXT,
+    ADMINS,
+)
 from storage.db import (
     init_db,
     enqueue_text,
@@ -24,29 +31,33 @@ from storage.db import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("layoutplace_bot")
 
-# канал может быть @username или -100...
 CHANNEL_ID = _CHANNEL_ID
 TZ = _TZ
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ===== единый стиль =====
+# ===== утилиты =====
+def is_admin(uid: int) -> bool:
+    return uid in ADMINS
+
 def normalize_caption(raw: str) -> str:
     raw = (raw or "").strip()
-    # добавляем блок ссылок внизу и убираем эмодзи
-    lines = [l for l in raw.splitlines() if l.strip()]
+    # убираем пустые строки в середине
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
     text = "\n".join(lines)
     text += (
         "\n\n"
-        "Общий альбом: " + ALBUM_URL + "\n"
-        "Покупка/вопросы: " + CONTACT_TEXT
+        f"Общий альбом: {ALBUM_URL}\n"
+        f"Покупка/вопросы: {CONTACT_TEXT}"
     )
     return text
 
+async def say_plain(m: Message, text: str):
+    """Отправить подсказку без HTML/Markdown (чтобы не ловить 'Unsupported start tag')."""
+    await m.answer(text, parse_mode=None, disable_web_page_preview=True)
+
 # ===== кэш альбомов (по media_group_id) =====
-# Когда ты пересылаешь альбом боту, сообщения летят пачкой.
-# Мы собираем элементы 2 минуты; /add_post (ответом) заберёт актуальную пачку.
 albums_cache: Dict[str, Dict[str, any]] = {}
 ALBUM_TTL_SEC = 120
 
@@ -92,8 +103,8 @@ def _add_album_piece(m: Message):
 async def cmd_start(m: Message):
     help_text = (
         "Бот готов к работе.\n\n"
-        "<b>Команды:</b>\n"
-        "/enqueue &lt;текст&gt; — добавить текст в очередь\n"
+        "Команды:\n"
+        "/enqueue <текст> — добавить текст в очередь\n"
         "/add_post — добавить форвард (фото/альбом) в очередь (вызови ответом на пересланное сообщение)\n"
         "/queue — показать размер очереди\n"
         "/post_oldest — опубликовать самый старый пост вручную\n"
@@ -104,10 +115,12 @@ async def cmd_start(m: Message):
 
 @dp.message(Command("enqueue"))
 async def cmd_enqueue(m: Message, command: CommandObject):
-    text = (command.args or "").strip()
-    if not text:
-        await m.answer("Использование: /enqueue <текст>")
-        return
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
+    args = m.text.split(maxsplit=1)
+    if len(args) < 2:
+        return await say_plain(m, "Использование: /enqueue <текст>")
+    text = args[1].strip()
     norm = normalize_caption(text)
     item_id = enqueue_text(norm)
     await m.answer(f"Текст добавлен в очередь (id={item_id}). В очереди: {get_count()}.")
@@ -117,16 +130,14 @@ async def on_any_media(m: Message):
     # ловим куски альбомов в кэш
     if m.media_group_id:
         _add_album_piece(m)
-    # одиночное медиа тоже можно добавить командой /add_post ответом
 
 @dp.message(Command("add_post"))
 async def cmd_add_post(m: Message):
-    """
-    Добавляет в очередь альбом/фото. Использовать как reply на пересланное сообщение из канала.
-    """
+    """Добавляет в очередь альбом/фото. Использовать как reply на пересланное сообщение из канала."""
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
     if not m.reply_to_message:
-        await m.answer("Сделай /add_post ответом на пересланное из канала сообщение (фото/альбом).")
-        return
+        return await say_plain(m, "Сделай /add_post ответом на пересланное из канала сообщение (фото/альбом).")
 
     src = m.reply_to_message
 
@@ -156,12 +167,10 @@ async def cmd_add_post(m: Message):
         elif src.document:
             media = [{"type": "document", "file_id": src.document.file_id}]
         else:
-            await m.answer("Не вижу медиа. Перешли фото/альбом и вызови /add_post ответом.")
-            return
+            return await say_plain(m, "Не вижу медиа. Перешли фото/альбом и вызови /add_post ответом.")
 
     if not media:
-        await m.answer("Альбом пуст. Перешли заново и повтори /add_post.")
-        return
+        return await say_plain(m, "Альбом пуст. Перешли заново и повтори /add_post.")
 
     norm_caption = normalize_caption(caption)
     item_id = enqueue_media(norm_caption, media, src_chat_id=src_chat_id, src_msg_ids=src_ids)
@@ -174,18 +183,20 @@ async def cmd_add_post(m: Message):
 
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
     await m.answer(f"В очереди: {get_count()}.")
 
 @dp.message(Command("clear_queue"))
 async def cmd_clear(m: Message):
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
     from storage.db import clear_all
     n = clear_all()
     await m.answer(f"Очередь очищена. Удалено записей: {n}.")
 
 async def _send_to_channel(item: dict) -> Optional[List[int]]:
-    """
-    Публикация в канал. Возвращает список новых message_id (для логов) или None.
-    """
+    """Публикация в канал. Возвращает список новых message_id (для логов) или None."""
     text: str = item["text"]
     media: List[Dict[str, str]] = item["media"]
 
@@ -209,10 +220,11 @@ async def _send_to_channel(item: dict) -> Optional[List[int]]:
 
 @dp.message(Command("post_oldest"))
 async def cmd_post_oldest(m: Message):
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
     rows = get_oldest(1)
     if not rows:
-        await m.answer("Очередь пуста.")
-        return
+        return await m.answer("Очередь пуста.")
     item = rows[0]
     new_ids = await _send_to_channel(item)
 
@@ -229,6 +241,8 @@ async def cmd_post_oldest(m: Message):
 
 @dp.message(Command("test_preview"))
 async def cmd_test_preview(m: Message):
+    if not is_admin(m.from_user.id):
+        return await say_plain(m, "Команда доступна только админам.")
     from config import ADMINS
     text = "<b>Тестовое превью</b>\nПост был бы тут за 45 минут до публикации."
     for aid in ADMINS:
