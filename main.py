@@ -1,5 +1,4 @@
 # main.py
-import os
 import asyncio
 import logging
 import time
@@ -15,16 +14,22 @@ from aiogram.types import Message
 from aiogram.filters import Command, CommandObject
 
 # ---- конфиг ----
-from config import TOKEN as BOT_TOKEN, ADMINS as _ADMINS_LIST, CHANNEL_ID as _CHANNEL_ID, TZ as _TZ
+from config import (
+    TOKEN as BOT_TOKEN,
+    CHANNEL_ID as _CHANNEL_ID,
+    TZ as _TZ,
+    ALBUM_URL,
+    CONTACT_TEXT,
+)
 
 # ---- работа с базой ----
 from storage.db import (
     init_db,
-    db_enqueue,
+    db_enqueue,          # очередь текстов (если используешь)
     get_oldest,
     find_similar_ids,
     bulk_delete,
-    queue_add,
+    queue_add,           # очередь копий (перепост из канала)
     queue_count_pending,
 )
 
@@ -33,7 +38,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("layoutplace_bot")
 
 # ---------------- CONFIG ----------------
-# Твои админы (жёстко прописал, как просил)
+# Жёстко фиксируем админов, как просил
 ADMINS: List[int] = [469734432, 6773668793]
 CHANNEL_ID: str | int = _CHANNEL_ID
 TZ: str = _TZ
@@ -45,17 +50,38 @@ def now_str() -> str:
 def is_admin(uid: Optional[int]) -> bool:
     return uid is not None and int(uid) in ADMINS
 
-# ---------------- Унификация подписи ----------------
+# ---------------- ЕДИНЫЙ СТИЛЬ (БЕЗ ЭМОДЗИ) ----------------
 def unify_caption(text: str | None) -> str:
-    text = (text or "").strip()
-    text = text.replace("Цена -", "Цена —")
-    while "  " in text:
-        text = text.replace("  ", " ")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    text = "\n".join(lines)
-    if "layoutplacebuy" not in text.lower():
-        text += "\n\n@layoutplacebuy"
-    return text
+    """
+    Приводим текст к единому строгому стилю, без эмодзи.
+    Добавляем два финальных блока:
+      - Общий альбом: <ALBUM_URL>
+      - Покупка / вопросы: <CONTACT_TEXT>
+    """
+    t = (text or "").strip()
+
+    # Нормализация пробелов и базовые правки
+    t = t.replace("Цена -", "Цена —")
+    while "  " in t:
+        t = t.replace("  ", " ")
+
+    # Разбиваем и чистим пустые строки
+    lines = [ln.strip() for ln in t.splitlines()]
+    lines = [ln for ln in lines if ln]
+    body = "\n".join(lines).strip()
+
+    # Хвост: альбом и контакт (без эмодзи)
+    tail: List[str] = []
+    if ALBUM_URL and (ALBUM_URL not in body):
+        tail.append(f"Общий альбом: {ALBUM_URL}")
+    low = body.lower()
+    if CONTACT_TEXT and (CONTACT_TEXT.lower() not in low):
+        tail.append(f"Покупка / вопросы: {CONTACT_TEXT}")
+
+    if tail:
+        body = (body + "\n\n" + "\n".join(tail)).strip()
+
+    return body
 
 # ---------------- Инициализация бота ----------------
 props = DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -103,7 +129,7 @@ async def _finalize_album(user_id: int, mgid: str):
     try:
         await bot.send_message(
             chat_id=user_id,
-            text=(f"✅ Альбом автоматически добавлен в очередь копирования: <code>{qid}</code>\n"
+            text=(f"Альбом добавлен в очередь: <code>{qid}</code>\n"
                   f"Элементов: <b>{len(ids_sorted)}</b>"),
             disable_web_page_preview=True
         )
@@ -142,8 +168,8 @@ async def cmd_start(m: Message):
         "/myid — показать твой Telegram ID\n"
         "/enqueue <code>&lt;текст&gt;</code> — добавить текст в очередь\n"
         "/queue — показать состояние очередей\n"
-        "/post_oldest — опубликовать старое объявление\n"
-        "/add_post — добавить одиночный пост из канала\n"
+        "/post_oldest — опубликовать старое объявление (из текстовой очереди)\n"
+        "/add_post — добавить одиночный пост из канала (или просто перешли альбом)\n"
         "/clear_albums_cache — очистить буфер альбомов\n"
         "/test_preview — проверить уведомления админу\n"
         "/now — текущее время"
@@ -195,7 +221,7 @@ async def cmd_post_oldest(m: Message):
     if not oldest:
         return await m.answer("Очередь пуста.")
     ad_id, text = oldest["id"], oldest["text"]
-    await bot.send_message(CHANNEL_ID, text)
+    await bot.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
     similar = find_similar_ids(ad_id, threshold=0.88)
     removed = bulk_delete([ad_id] + similar)
     await m.answer(f"Опубликовано: {ad_id}\nУдалено из очереди: {removed}")
@@ -208,101 +234,23 @@ async def cmd_test_preview(message: types.Message):
         try:
             await bot.send_message(
                 admin_id,
-                f"✅ Тестовое уведомление админу работает!\n🕒 {now_str()}",
+                f"Тестовое уведомление админу.\n{now_str()}",
                 disable_web_page_preview=True
             )
             sent += 1
         except Exception as e:
             log.exception(f"Ошибка при отправке админу {admin_id}: {e}")
-            await message.answer(f"⚠️ Ошибка при отправке админу {admin_id}: {e}")
+            await message.answer(f"Ошибка при отправке админу {admin_id}: {e}")
     if sent > 0:
-        await message.answer("🔔 Уведомление успешно отправлено всем админам.")
+        await message.answer("Уведомление отправлено всем админам.")
     else:
-        await message.answer("❌ Не удалось отправить уведомления.")
-        
-        # ---------- Импорт последних N постов из канала в очередь ----------
-
-from aiogram.types import Message
-from aiogram.filters import Command, CommandObject
-
-MAX_BULK_IMPORT = 500  # защита от слишком больших выборок
-
-
-def _channel_slug() -> str:
-    """
-    Превращаем CHANNEL_ID из вида '@layoutplace' -> 'layoutplace'
-    (нужно для формирования t.me ссылки).
-    """
-    cid = str(CHANNEL_ID)
-    return cid[1:] if cid.startswith("@") else cid
-
-
-@dp.message(Command("import_from"))
-async def cmd_import_from(m: Message, command: CommandObject):
-    """
-    /import_from <N>
-    Добавляет в очередь ссылки на последние N сообщений канала.
-    Ссылки в очереди потом обрабатываются планировщиком как перепост с удалением оригинала.
-    """
-    # доступ только админам
-    if str(m.from_user.id) not in ADMINS:
-        return
-
-    # разбор аргумента
-    n = 0
-    if command.args:
-        try:
-            n = int(command.args.strip())
-        except Exception:
-            pass
-    if n <= 0:
-        await m.answer("Использование: <code>/import_from N</code>\nНапример: <code>/import_from 50</code>", disable_web_page_preview=True)
-        return
-
-    # ограничим диапазон
-    n = min(MAX_BULK_IMPORT, max(1, n))
-
-    await m.answer(f"Начинаю импорт последних <b>{n}</b> сообщений из канала…")
-
-    # 1) Получаем «верхний» message_id: отправим и сразу удалим пробное сообщение в канал
-    try:
-        probe = await bot.send_message(CHANNEL_ID, "🔎 sync", disable_notification=True)
-        last_id = probe.message_id
-        # удаляем служебное
-        try:
-            await bot.delete_message(CHANNEL_ID, last_id)
-        except Exception:
-            pass
-    except Exception as e:
-        await m.answer(f"Не удалось получить верхний message_id канала. Убедись, что бот — админ.\nОшибка: <code>{e}</code>")
-        return
-
-    slug = _channel_slug()
-    start_id = max(1, last_id - n)     # включительно
-    end_id = last_id - 1               # включительно (сам probe мы удалили)
-
-    added = 0
-    for mid in range(end_id, start_id - 1, -1):
-        link = f"https://t.me/{slug}/{mid}"
-        # Кладём в очередь как ссылку. Планировщик уже умеет разруливать такие элементы.
-        try:
-            db_enqueue(link)
-            added += 1
-        except Exception:
-            # пропускаем проблемные id (напр. системные/удалённые сообщения)
-            continue
-
-    await m.answer(
-        f"Готово ✅ В очередь добавлено <b>{added}</b> ссылок "
-        f"(просмотрено диапазон message_id: {start_id}…{end_id})."
-    )
-
+        await message.answer("Не удалось отправить уведомления.")
 
 # ---------------- Точка входа ----------------
 async def main():
     init_db()
     me = await bot.me()
-    log.info("✅ Бот запущен: @%s (TZ=%s)", me.username, TZ)
+    log.info("Бот запущен: @%s (TZ=%s)", me.username, TZ)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
