@@ -1,202 +1,115 @@
 # scheduler.py
-import os
 import asyncio
 import logging
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
-from typing import List
-import json
+from typing import List, Dict
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramUnauthorizedError, TelegramBadRequest
+from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 
-# конфиг
-from config import TOKEN as BOT_TOKEN, CHANNEL_ID, TZ as TZ_NAME, ADMINS, ALBUM_URL, CONTACT_TEXT
+from config import TOKEN as BOT_TOKEN, CHANNEL_ID, TZ, ADMINS
+from storage.db import init_db, get_oldest, get_count, delete_by_id
 
-# функции БД (очередь копий)
-from storage.db import (
-    init_db,
-    queue_next_pending,   # взять самую старую запись в статусе pending/previewed
-    queue_mark_status,    # проставить статус: previewed/posted/error
-    queue_count_pending,  # количество pending
-)
-
-# ---------------- ЛОГИ ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("scheduler")
 
-# ---------------- РАСПИСАНИЕ ----------------
-TIMES_RAW = os.getenv("TIMES", "12:00,16:00,20:00")
-PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
+BOT = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+ZONE = ZoneInfo(TZ)
 
-tz = ZoneInfo(TZ_NAME)
+# слоты и превью
+SLOTS = [time(12, 0), time(16, 0), time(20, 0)]
+PREVIEW_DELTA = timedelta(minutes=45)
 
-def _parse_times(s: str) -> List[dtime]:
-    out: List[dtime] = []
-    for token in s.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        h, m = token.split(":")
-        out.append(dtime(hour=int(h), minute=int(m)))
-    return out or [dtime(12, 0), dtime(16, 0), dtime(20, 0)]
-
-TIMES = _parse_times(TIMES_RAW)
-
-def _now() -> datetime:
-    return datetime.now(tz)
-
-def _next_slot(now: datetime) -> datetime:
-    today = [datetime.combine(now.date(), t, tzinfo=tz) for t in TIMES]
-    future = [dt for dt in today if dt > now]
-    if future:
-        return future[0]
-    tomorrow = now.date() + timedelta(days=1)
-    return datetime.combine(tomorrow, TIMES[0], tzinfo=tz)
-
-# ---------------- СТИЛЬ (тот же, без эмодзи) ----------------
-def unify_caption(text: str | None) -> str:
-    t = (text or "").strip()
-    t = t.replace("Цена -", "Цена —")
-    while "  " in t:
-        t = t.replace("  ", " ")
-    lines = [ln.strip() for ln in t.splitlines()]
-    lines = [ln for ln in lines if ln]
-    body = "\n".join(lines).strip()
-
-    tail = []
-    if ALBUM_URL and (ALBUM_URL not in body):
-        tail.append(f"Общий альбом: {ALBUM_URL}")
-    low = body.lower()
-    if CONTACT_TEXT and (CONTACT_TEXT.lower() not in low):
-        tail.append(f"Покупка / вопросы: {CONTACT_TEXT}")
-    if tail:
-        body = (body + "\n\n" + "\n".join(tail)).strip()
-    return body
-
-async def _notify_admins(bot: Bot, text: str):
+async def notify_admins(text: str):
     for aid in ADMINS:
         try:
-            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-        except TelegramUnauthorizedError:
-            log.warning("Админ %s недоступен (Unauthorized). Нажми /start боту в ЛС.", aid)
+            await BOT.send_message(aid, text, disable_web_page_preview=True)
         except Exception as e:
-            log.warning("Не удалось отправить админу %s: %s", aid, e)
+            log.warning(f"Админ {aid} недоступен ({e}). Нажми /start боту в ЛС.")
 
-async def copy_and_delete(
-    bot: Bot,
-    source_chat_id: int | str,
-    message_ids: List[int],
-    target: int | str,
-    caption_override: str | None,
-):
-    """
-    Копируем пост/альбом без автора (copy_message).
-    Первому элементу ставим унифицированную подпись.
-    После публикации пытаемся удалить оригиналы.
-    """
-    new_caption = unify_caption(caption_override)
-    for idx, mid in enumerate(message_ids):
-        if idx == 0 and new_caption:
-            await bot.copy_message(
-                chat_id=target,
-                from_chat_id=source_chat_id,
-                message_id=mid,
-                caption=new_caption,
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await bot.copy_message(
-                chat_id=target,
-                from_chat_id=source_chat_id,
-                message_id=mid,
-            )
+def next_slot(now: datetime) -> datetime:
+    today = now.date()
+    candidates = [datetime.combine(today, t, tzinfo=ZONE) for t in SLOTS]
+    future = [dt for dt in candidates if dt > now]
+    if future:
+        return future[0]
+    # иначе — первый слот следующего дня
+    return datetime.combine(today + timedelta(days=1), SLOTS[0], tzinfo=ZONE)
 
-    # удалить оригиналы (если есть права delete в источнике)
-    for mid in message_ids:
-        try:
-            await bot.delete_message(chat_id=source_chat_id, message_id=mid)
-        except TelegramBadRequest:
-            pass
-        except Exception as e:
-            log.debug("Ошибка удаления исходного %s/%s: %s", source_chat_id, mid, e)
+async def post_item(item: Dict):
+    text = item["text"]
+    media = item["media"]
 
-# ---------------- ОСНОВНОЙ ЦИКЛ ----------------
+    if not media:
+        await BOT.send_message(CHANNEL_ID, text, disable_web_page_preview=True)
+    else:
+        ims = []
+        for i, it in enumerate(media):
+            t = it["type"]
+            fid = it["file_id"]
+            if t == "photo":
+                ims.append(InputMediaPhoto(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+            elif t == "video":
+                ims.append(InputMediaVideo(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+            elif t == "document":
+                ims.append(InputMediaDocument(media=fid, caption=text if i == 0 else None, parse_mode=ParseMode.HTML))
+        await BOT.send_media_group(CHANNEL_ID, ims)
+
+    # удаляем исходники, если знаем
+    if item.get("src_chat_id") and item.get("src_msg_ids"):
+        for mid in item["src_msg_ids"]:
+            try:
+                await BOT.delete_message(item["src_chat_id"], mid)
+            except Exception as e:
+                log.warning(f"Не смог удалить старое сообщение {mid}: {e}")
+
 async def run_scheduler():
-    props = DefaultBotProperties(parse_mode=ParseMode.HTML)
-    bot = Bot(BOT_TOKEN, default=props)
-
-    await _notify_admins(
-        bot,
-        f"Планировщик запущен.\nСлоты: <code>{TIMES_RAW}</code>\n"
-        f"Превью: <b>{PREVIEW_BEFORE_MIN}</b> мин.\nВ очереди: <b>{queue_count_pending()}</b>",
-    )
+    init_db()
+    now = datetime.now(ZONE)
+    log.info("Scheduler TZ=%s, times=%s, preview_before=45 min", TZ, ",".join([t.strftime("%H:%M") for t in SLOTS]))
 
     while True:
-        now = _now()
-        slot = _next_slot(now)
-        preview_at = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
-        log.info(
-            "Следующий слот постинга: %s (%s). Превью в: %s",
-            slot.strftime("%Y-%m-%d %H:%M"), TZ_NAME, preview_at.strftime("%Y-%m-%d %H:%M")
-        )
+        now = datetime.now(ZONE)
+        slot = next_slot(now)
+        preview_at = slot - PREVIEW_DELTA
 
-        # ---- дождаться времени превью ----
-        delay_preview = max(0.0, (preview_at - _now()).total_seconds())
-        await asyncio.sleep(delay_preview)
+        # превью (если ещё не пропустили)
+        if now < preview_at:
+            await notify_admins(f"Предстоящее окно постинга: <b>{slot.strftime('%Y-%m-%d %H:%M')}</b> ({TZ}). "
+                                f"В очереди сейчас: <b>{get_count()}</b>.")
 
-        row = queue_next_pending()
-        if row:
-            caption = row.get("caption_override") or ""
-            await _notify_admins(
-                bot,
-                "Предпросмотр публикации\n"
-                f"Время поста: <code>{slot.strftime('%Y-%m-%d %H:%M')}</code> ({TZ_NAME})\n"
-                f"Источник: <code>{row['source_chat_id']}</code>\n"
-                f"Messages: <code>{row['message_ids']}</code>\n\n"
-                f"{caption}"
-            )
-            queue_mark_status(row["id"], "previewed")
+            sleep_sec = (preview_at - now).total_seconds()
+            await asyncio.sleep(sleep_sec)
+
+        # перед самим слотом ещё раз проверим и отправим превью, если кто-то не получил
+        await notify_admins(f"Слот постинга <b>{slot.strftime('%Y-%m-%d %H:%M')}</b> ({TZ}). "
+                            f"Пытаюсь опубликовать самый старый пост. В очереди: <b>{get_count()}</b>.")
+
+        # ждём до точного времени слота
+        now2 = datetime.now(ZONE)
+        if now2 < slot:
+            await asyncio.sleep((slot - now2).total_seconds())
+
+        # берём самый старый
+        rows = get_oldest(1)
+        if not rows:
+            await notify_admins("Очередь пуста — публиковать нечего.")
         else:
-            await _notify_admins(bot, "Очередь пуста — публиковать нечего.")
+            item = rows[0]
+            try:
+                await post_item(item)
+                delete_by_id(item["id"])
+                await notify_admins("✅ Опубликовал пост. В очереди осталось: <b>%d</b>." % get_count())
+            except Exception as e:
+                await notify_admins(f"❌ Ошибка публикации: <code>{e}</code>")
 
-        # ---- дождаться самого слота ----
-        delay_post = max(0.0, (slot - _now()).total_seconds())
-        await asyncio.sleep(delay_post)
+        # маленькая пауза и идём к следующему циклу
+        await asyncio.sleep(3)
 
-        row = queue_next_pending()
-        if not row:
-            log.info("Слот %s: очередь пуста.", slot.strftime("%H:%M"))
-            continue
-
-        # message_ids — JSON
-        try:
-            message_ids = [int(x) for x in json.loads(row["message_ids"])]
-        except Exception:
-            message_ids = [int(x) for x in eval(row["message_ids"])]
-
-        try:
-            await copy_and_delete(
-                bot=bot,
-                source_chat_id=row["source_chat_id"],
-                message_ids=message_ids,
-                target=CHANNEL_ID,
-                caption_override=row.get("caption_override"),
-            )
-            queue_mark_status(row["id"], "posted")
-            await _notify_admins(bot, f"Опубликовано из <code>{row['source_chat_id']}</code> — ids={message_ids}")
-            log.info("Posted task #%s", row["id"])
-        except Exception as e:
-            queue_mark_status(row["id"], "error")
-            await _notify_admins(bot, f"Ошибка публикации id={row['id']}: <code>{e}</code>")
-            log.exception("Ошибка публикации task #%s: %s", row["id"], e)
-
-# ---------------- ENTRY ----------------
 async def main():
-    init_db()
-    log.info("Scheduler TZ=%s, times=%s, preview_before=%s min", TZ_NAME, TIMES_RAW, PREVIEW_BEFORE_MIN)
     await run_scheduler()
 
 if __name__ == "__main__":
