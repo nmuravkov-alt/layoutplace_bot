@@ -1,13 +1,16 @@
 import os
 
-# ========== Основные настройки ==========
-TOKEN = os.getenv("BOT_TOKEN", "").strip()              # Токен Telegram-бота
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()        # ID канала или username (@channel)
-TZ = os.getenv("TZ", "Europe/Moscow")                   # Часовой пояс
+# === Бот / Канал / Часовой пояс ===
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()  # @username или -100...
+TZ = os.getenv("TZ", "Europe/Moscow")
 
-# ========== Админы ==========
-# В Railway переменная ADMINS должна быть: 123456789,987654321
+# === Админы (числовые ID через запятую) ===
 ADMINS = [int(a.strip()) for a in os.getenv("ADMINS", "").split(",") if a.strip()]
 
-# ========== База данных (если нужно позже) ==========
+# === Единый стиль: ссылка на общий альбом и контакт ===
+ALBUM_URL = os.getenv("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26").strip()
+CONTACT_TEXT = os.getenv("CONTACT_TEXT", "@layoutplacebuy").strip()
+
+# === База (если нужен путь) ===
 DB_PATH = os.getenv("DB_PATH", "data.db")
