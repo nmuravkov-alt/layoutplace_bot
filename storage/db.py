@@ -1,128 +1,93 @@
 # storage/db.py
-import os
 import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from difflib import SequenceMatcher
-import re
+from typing import Any, Dict, List, Optional, Tuple
 
-DB_PATH = os.getenv("DB_PATH", "storage/db.sqlite")
+DB_PATH = "data.db"  # при желании переопределишь через utils/config.py и передай сюда
 
 @contextmanager
 def _cx():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     cx = sqlite3.connect(DB_PATH)
     try:
-        cx.row_factory = sqlite3.Row
         yield cx
-        cx.commit()
     finally:
+        cx.commit()
         cx.close()
 
-_word_re = re.compile(r"[A-Za-zА-Яа-я0-9]+")
-
-def _normalize(text: str) -> str:
-    tokens = _word_re.findall((text or "").lower())
-    return " ".join(tokens)
-
-def _similar(a: str, b: str) -> float:
-    return SequenceMatcher(a=a, b=b).ratio()
-
-# ----------------- Инициализация БД -----------------
-def init_db():
+def init_db() -> None:
     with _cx() as cx:
         cx.execute("""
-        CREATE TABLE IF NOT EXISTS ads(
+        CREATE TABLE IF NOT EXISTS queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
-            norm TEXT NOT NULL,
+            media_json TEXT,                 -- JSON: список элементов альбома (type, file_id)
+            src_chat_id INTEGER,             -- откуда форвардили (для удаления старого)
+            src_msg_ids_json TEXT,           -- JSON: список message_id исходного поста/альбома
             created_at INTEGER NOT NULL
         )
         """)
-        cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_created ON ads(created_at)")
-        cx.execute("CREATE INDEX IF NOT EXISTS idx_ads_norm ON ads(norm)")
-
-        # Очередь копирования из канала
-        cx.execute("""
-        CREATE TABLE IF NOT EXISTS queue(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_chat_id INTEGER NOT NULL,
-            message_ids TEXT NOT NULL,           -- JSON: [int,...]
-            caption_override TEXT,               -- если нужно заменить подпись
-            status TEXT NOT NULL DEFAULT 'pending',  -- pending|previewed|posted|error
-            created_at INTEGER NOT NULL,
-            posted_at INTEGER
-        )
-        """)
-        cx.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON queue(status)")
         cx.execute("CREATE INDEX IF NOT EXISTS idx_queue_created ON queue(created_at)")
 
-# --------------- Старые текстовые объявления (для команды /enqueue) ---------------
-def db_enqueue(text: str) -> int:
-    now = int(time.time())
+# --------- Запись в очередь ---------
+
+def enqueue_text(text: str) -> int:
     with _cx() as cx:
         cur = cx.execute(
-            "INSERT INTO ads(text, norm, created_at) VALUES(?,?,?)",
-            (text, _normalize(text), now)
+            "INSERT INTO queue(text, media_json, src_chat_id, src_msg_ids_json, created_at) VALUES (?, NULL, NULL, NULL, ?)",
+            (text, int(time.time()))
         )
         return cur.lastrowid
 
-def get_oldest(limit: int = 1):
-    with _cx() as cx:
-        cur = cx.execute("SELECT * FROM ads ORDER BY created_at ASC LIMIT ?", (limit,))
-        items = [dict(r) for r in cur.fetchall()]
-        if limit == 1:
-            return items[0] if items else None
-        return items
-
-def delete_by_id(ad_id: int) -> int:
-    with _cx() as cx:
-        cur = cx.execute("DELETE FROM ads WHERE id = ?", (ad_id,))
-        return cur.rowcount
-
-def find_similar_ids(ad_id: int, threshold: float = 0.88):
-    with _cx() as cx:
-        row = cx.execute("SELECT id, norm FROM ads WHERE id = ?", (ad_id,)).fetchone()
-        if not row:
-            return []
-        norm = row["norm"]
-        cur = cx.execute("SELECT id, norm FROM ads WHERE id != ?", (ad_id,))
-        result = []
-        for r in cur.fetchall():
-            if _similar(norm, r["norm"]) >= threshold:
-                result.append(r["id"])
-        return result
-
-def bulk_delete(ids) -> int:
-    if not ids:
-        return 0
-    ids = list(set(int(x) for x in ids))
-    with _cx() as cx:
-        q = f"DELETE FROM ads WHERE id IN ({','.join(['?']*len(ids))})"
-        cur = cx.execute(q, ids)
-        return cur.rowcount
-
-# --------------------- Очередь перепостов из канала ---------------------
-def queue_add(source_chat_id: int, message_ids: list[int], caption_override: str | None = None) -> int:
+def enqueue_media(
+    text: str,
+    media: List[Dict[str, str]],
+    src_chat_id: Optional[int] = None,
+    src_msg_ids: Optional[List[int]] = None,
+) -> int:
     with _cx() as cx:
         cur = cx.execute(
-            "INSERT INTO queue(source_chat_id, message_ids, caption_override, status, created_at) VALUES(?,?,?,?,?)",
-            (int(source_chat_id), json.dumps([int(x) for x in message_ids]), caption_override, "pending", int(time.time()))
+            "INSERT INTO queue(text, media_json, src_chat_id, src_msg_ids_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                text,
+                json.dumps(media, ensure_ascii=False),
+                src_chat_id,
+                json.dumps(src_msg_ids or [], ensure_ascii=False),
+                int(time.time()),
+            ),
         )
         return cur.lastrowid
 
-def queue_next_pending():
-    with _cx() as cx:
-        r = cx.execute("SELECT * FROM queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1").fetchone()
-        return dict(r) if r else None
+# --------- Чтение / удаление ---------
 
-def queue_mark_status(qid: int, status: str):
+def get_oldest(limit: int = 1) -> List[Dict[str, Any]]:
     with _cx() as cx:
-        cx.execute("UPDATE queue SET status = ?, posted_at = CASE WHEN ?='posted' THEN ? ELSE posted_at END WHERE id = ?",
-                   (status, status, int(time.time()), qid))
+        cur = cx.execute("SELECT id, text, media_json, src_chat_id, src_msg_ids_json, created_at FROM queue ORDER BY created_at ASC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+    items: List[Dict[str, Any]] = []
+    for r in rows:
+        items.append({
+            "id": r[0],
+            "text": r[1],
+            "media": json.loads(r[2]) if r[2] else [],
+            "src_chat_id": r[3],
+            "src_msg_ids": json.loads(r[4]) if r[4] else [],
+            "created_at": r[5],
+        })
+    return items
 
-def queue_count_pending() -> int:
+def get_count() -> int:
     with _cx() as cx:
-        r = cx.execute("SELECT COUNT(*) c FROM queue WHERE status='pending'").fetchone()
-        return int(r["c"]) if r else 0
+        cur = cx.execute("SELECT COUNT(*) FROM queue")
+        (n,) = cur.fetchone()
+        return int(n)
+
+def delete_by_id(item_id: int) -> None:
+    with _cx() as cx:
+        cx.execute("DELETE FROM queue WHERE id=?", (item_id,))
+
+def clear_all() -> int:
+    with _cx() as cx:
+        cur = cx.execute("DELETE FROM queue")
+        return cur.rowcount
