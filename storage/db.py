@@ -3,9 +3,9 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-DB_PATH = "data.db"  # при желании переопределишь через utils/config.py и передай сюда
+from config import DB_PATH  # путь к sqlite задаётся через переменную окружения или в config.py
 
 @contextmanager
 def _cx():
@@ -63,7 +63,11 @@ def enqueue_media(
 
 def get_oldest(limit: int = 1) -> List[Dict[str, Any]]:
     with _cx() as cx:
-        cur = cx.execute("SELECT id, text, media_json, src_chat_id, src_msg_ids_json, created_at FROM queue ORDER BY created_at ASC LIMIT ?", (limit,))
+        cur = cx.execute(
+            "SELECT id, text, media_json, src_chat_id, src_msg_ids_json, created_at "
+            "FROM queue ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        )
         rows = cur.fetchall()
     items: List[Dict[str, Any]] = []
     for r in rows:
