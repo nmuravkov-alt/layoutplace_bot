@@ -1,83 +1,104 @@
-import sqlite3, json, time, os
-from typing import Optional, Tuple, List, Dict
+import os
+import json
+import sqlite3
+import time
 
-DB_PATH = os.getenv("DB_PATH", "/data/data.db")
+DB_DIR = os.path.join(os.getcwd(), "data")
+DB_PATH = os.path.join(DB_DIR, "bot.db")
 
-def _cx():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+def _connect():
+    os.makedirs(DB_DIR, exist_ok=True)
+    cx = sqlite3.connect(DB_PATH)
+    cx.row_factory = sqlite3.Row
+    return cx
 
 def init_db():
-    cx = _cx()
+    cx = _connect()
     cur = cx.cursor()
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS queue(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        src_chat_id INTEGER NOT NULL,
-        src_msg_id  INTEGER NOT NULL,
-        caption     TEXT,
-        created_at  INTEGER NOT NULL
-      )
+        CREATE TABLE IF NOT EXISTS queue(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            items_json TEXT NOT NULL,
+            caption TEXT,
+            src_chat_id INTEGER,
+            src_msg_id INTEGER,
+            created_at INTEGER NOT NULL
+        )
     """)
     cur.execute("""
-      CREATE TABLE IF NOT EXISTS meta(
-        k TEXT PRIMARY KEY,
-        v TEXT
-      )
+        CREATE TABLE IF NOT EXISTS meta(
+            key TEXT PRIMARY KEY,
+            val TEXT
+        )
     """)
     cx.commit()
     cx.close()
 
-def enqueue(src_chat_id:int, src_msg_id:int, caption:str|None)->int:
-    cx = _cx()
+def enqueue(items, caption, src):
+    src_chat_id, src_msg_id = (src or (None, None))
+    cx = _connect()
     cur = cx.cursor()
     cur.execute(
-      "INSERT INTO queue(src_chat_id,src_msg_id,caption,created_at) VALUES(?,?,?,?)",
-      (src_chat_id, src_msg_id, caption, int(time.time()))
+        "INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at) VALUES(?,?,?,?,?)",
+        (json.dumps(items), caption, src_chat_id, src_msg_id, int(time.time()))
     )
     qid = cur.lastrowid
-    cx.commit(); cx.close()
+    cx.commit()
+    cx.close()
     return qid
 
-def dequeue_oldest()->Optional[Tuple[int,int,int,Optional[str]]]:
-    cx = _cx(); cur = cx.cursor()
-    row = cur.execute(
-        "SELECT id,src_chat_id,src_msg_id,caption FROM queue ORDER BY id LIMIT 1"
-    ).fetchone()
+def dequeue_oldest():
+    cx = _connect()
+    cur = cx.cursor()
+    cur.execute("SELECT id, items_json, caption, src_chat_id, src_msg_id FROM queue ORDER BY id LIMIT 1")
+    row = cur.fetchone()
     if not row:
-        cx.close(); return None
-    cur.execute("DELETE FROM queue WHERE id=?", (row[0],))
-    cx.commit(); cx.close()
-    # id, chat, msg, caption
-    return (row[0], row[1], row[2], row[3])
-
-def peek_oldest()->Optional[Tuple[int,int,int,Optional[str]]]:
-    cx = _cx(); cur = cx.cursor()
-    row = cur.execute(
-        "SELECT id,src_chat_id,src_msg_id,caption FROM queue ORDER BY id LIMIT 1"
-    ).fetchone()
+        cx.close()
+        return None
+    cur.execute("DELETE FROM queue WHERE id=?", (row["id"],))
+    cx.commit()
     cx.close()
-    if not row: return None
-    return (row[0], row[1], row[2], row[3])
+    return {
+        "id": row["id"],
+        "items": json.loads(row["items_json"]),
+        "caption": row["caption"] or "",
+        "src": (row["src_chat_id"], row["src_msg_id"]) if row["src_chat_id"] and row["src_msg_id"] else None
+    }
 
-def count()->int:
-    cx = _cx(); cur = cx.cursor()
-    n = cur.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
-    cx.close(); return int(n)
-
-def clear():
-    cx = _cx(); cur = cx.cursor()
-    cur.execute("DELETE FROM queue")
-    cx.commit(); cx.close()
-
-# last published id
-def get_last_published_id()->Optional[int]:
-    cx = _cx(); cur = cx.cursor()
-    row = cur.execute("SELECT v FROM meta WHERE k='last_pub_id'").fetchone()
+def peek_oldest():
+    cx = _connect()
+    cur = cx.cursor()
+    cur.execute("SELECT id, items_json, caption, src_chat_id, src_msg_id FROM queue ORDER BY id LIMIT 1")
+    row = cur.fetchone()
     cx.close()
-    return int(row[0]) if row and row[0] else None
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "items": json.loads(row["items_json"]),
+        "caption": row["caption"] or "",
+        "src": (row["src_chat_id"], row["src_msg_id"]) if row["src_chat_id"] and row["src_msg_id"] else None
+    }
 
-def set_last_published_id(msg_id:int):
-    cx = _cx(); cur = cx.cursor()
-    cur.execute("INSERT INTO meta(k,v) VALUES('last_pub_id',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(msg_id),))
-    cx.commit(); cx.close()
+def get_count():
+    cx = _connect()
+    cur = cx.cursor()
+    cur.execute("SELECT COUNT(*) AS c FROM queue")
+    c = cur.fetchone()["c"]
+    cx.close()
+    return int(c)
+
+def set_meta(key, val):
+    cx = _connect()
+    cur = cx.cursor()
+    cur.execute("INSERT INTO meta(key,val) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET val=excluded.val", (key, val))
+    cx.commit()
+    cx.close()
+
+def get_meta(key, default=None):
+    cx = _connect()
+    cur = cx.cursor()
+    cur.execute("SELECT val FROM meta WHERE key=?", (key,))
+    row = cur.fetchone()
+    cx.close()
+    return row["val"] if row else default
