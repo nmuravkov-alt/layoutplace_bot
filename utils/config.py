@@ -17,6 +17,11 @@ CONTACT_TEXT = os.getenv("CONTACT_TEXT", "@layoutplacebuy").strip()
 
 DB_PATH      = os.getenv("DB_PATH", "/data/data.db")
 
+# новенькое
+AUTO_POST            = _bool(os.getenv("AUTO_POST", "1"))   # включён по умолчанию
+CATCH_UP_MISSED      = _bool(os.getenv("CATCH_UP_MISSED", "0"))  # не «догоняем»
+POST_WINDOW_SECONDS  = int(os.getenv("POST_WINDOW_SECONDS", "60"))  # окно +-60с на срабатывание
+
 # безопасность/валидация
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("BOT_TOKEN пустой/некорректный")
