@@ -1,13 +1,18 @@
-"""
-Простой раннер, который стартует main.py как модуль.
-Оставлен для совместимости с твоей инфраструктурой Railway.
-"""
+# runner.py
 import asyncio
 import logging
-from main import _run
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | runner | %(message)s")
+from main import _run as run_bot
+from scheduler import run_scheduler
+
+logging.basicConfig(level=logging.INFO)
+
+async def _run():
+    # Запускаем бот и планировщик параллельно
+    await asyncio.gather(
+        run_bot(),
+        run_scheduler(),
+    )
 
 if __name__ == "__main__":
-    logging.info("Starting bot instance...")
     asyncio.run(_run())
