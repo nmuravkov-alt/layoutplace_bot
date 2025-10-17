@@ -5,42 +5,40 @@ from typing import List, Optional, Tuple, Dict, Any
 from config import DB_PATH
 
 def _connect():
-    # один коннект на поток; планировщик и хэндлеры могут стучаться параллельно
     cx = sqlite3.connect(DB_PATH, check_same_thread=False)
     cx.row_factory = sqlite3.Row
     return cx
 
-# --- служебка: узнать существующие поля таблицы ---
 def _columns(cx: sqlite3.Connection, table: str) -> set[str]:
     cur = cx.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}  # name = col[1]
+    return {row[1] for row in cur.fetchall()}
 
 def _ensure_queue_schema(cx: sqlite3.Connection):
     cur = cx.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT
-            -- остальные поля добавляем/проверяем миграциями ниже
         )
     """)
     existing = _columns(cx, "queue")
 
-    # требуемые поля текущей версии
-    needed = [
+    # актуальные поля
+    need = [
         ("items_json", "TEXT", None),
         ("caption", "TEXT", None),
         ("src_chat_id", "INTEGER", None),
         ("src_msg_id", "INTEGER", None),
         ("created_at", "INTEGER", 0),
     ]
-
-    for name, typ, default in needed:
+    for name, typ, default in need:
         if name not in existing:
             if default is None:
                 cur.execute(f"ALTER TABLE queue ADD COLUMN {name} {typ}")
             else:
                 cur.execute(f"ALTER TABLE queue ADD COLUMN {name} {typ} DEFAULT {default}")
 
+    # если есть старые поля — мягко обрабатываем их существование
+    # (например, legacy: payload NOT NULL)
     cx.commit()
 
 def _ensure_albums_cache_schema(cx: sqlite3.Connection):
@@ -62,10 +60,7 @@ def init_db():
     finally:
         cx.close()
 
-# ---- API ----
-# Формат items_json:
-# json.dumps([{"type":"photo","file_id":"..."}, {"type":"video","file_id":"..."}])
-
+# ---------- Albums cache ----------
 def cache_album_upsert(media_group_id: str, items: List[Dict[str, Any]]):
     cx = _connect()
     cur = cx.cursor()
@@ -95,14 +90,31 @@ def cache_album_clear():
     cx.commit()
     cx.close()
 
+# ---------- Queue API ----------
+def _has_payload_column() -> bool:
+    cx = _connect()
+    try:
+        cols = _columns(cx, "queue")
+        return "payload" in cols
+    finally:
+        cx.close()
+
 def enqueue(items: List[Dict[str, Any]], caption: str = "", src: Optional[Tuple[int, int]] = None) -> int:
     src_chat_id, src_msg_id = (src or (None, None))
     cx = _connect()
     cur = cx.cursor()
-    cur.execute("""
-        INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
-        VALUES(?,?,?,?,?)
-    """, (json.dumps(items), caption, src_chat_id, src_msg_id, int(time.time())))
+    items_json = json.dumps(items)
+    if _has_payload_column():
+        # Легаси-таблица требует payload NOT NULL — кладём пустую строку
+        cur.execute("""
+            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at, payload)
+            VALUES(?,?,?,?,?,?)
+        """, (items_json, caption, src_chat_id, src_msg_id, int(time.time()), ""))
+    else:
+        cur.execute("""
+            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
+            VALUES(?,?,?,?,?)
+        """, (items_json, caption, src_chat_id, src_msg_id, int(time.time())))
     qid = cur.lastrowid
     cx.commit()
     cx.close()
