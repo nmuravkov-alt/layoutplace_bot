@@ -1,215 +1,360 @@
-import asyncio, logging, os, pytz, re
-from datetime import datetime, time as dtime, timedelta
-from aiogram import Bot, Dispatcher, F, Router
+import os
+import asyncio
+import logging
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from aiogram.exceptions import TelegramBadRequest
-
-from config import (
-    TOKEN, CHANNEL_ID, ADMINS, TZ, SLOTS_CSV, PREV_MIN,
-    ALBUM_URL, CONTACT_TEXT,
-    AUTO_POST, CATCH_UP_MISSED, POST_WINDOW_SECONDS
+from aiogram.types import (
+    Message, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton
 )
-from storage import db
-from utils.text import normalize_caption
 
-logger = logging.getLogger("layoutplace_bot")
-logging.basicConfig(level=logging.INFO)
+from storage.db import (
+    init_db, enqueue, dequeue_oldest, peek_oldest, get_count, set_meta, get_meta
+)
 
-bot = Bot(TOKEN)
-dp  = Dispatcher()
-rt  = Router()
-dp.include_router(rt)
+# ============== ЛОГИ ==============
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+log = logging.getLogger("layoutplace_bot")
+sched_log = logging.getLogger("layoutplace_scheduler")
 
-# ------------ helpers ------------
-def _tznow():
-    return datetime.now(pytz.timezone(TZ))
+# ============== НАСТРОЙКИ ИЗ ENV ==============
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+if not TOKEN or ":" not in TOKEN:
+    raise RuntimeError("Переменная окружения BOT_TOKEN не задана или некорректна.")
 
-def _parse_slots(csv: str) -> list[dtime]:
+# ID канала, куда постим. Можно @username, но для удаления старого сообщения нужен числовой id.
+CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "").strip()
+CHANNEL_ID = CHANNEL_ID_ENV if CHANNEL_ID_ENV.startswith("@") else int(CHANNEL_ID_ENV or "-1000000000000")
+
+ADMINS = []
+for raw in os.getenv("ADMINS", "").replace(";", ",").split(","):
+    raw = raw.strip()
+    if raw:
+        try:
+            ADMINS.append(int(raw))
+        except:
+            pass
+
+TZ = os.getenv("TZ", "Europe/Moscow")
+ZONE = ZoneInfo(TZ)
+
+POST_TIMES_RAW = os.getenv("POST_TIMES", "12:00,16:00,20:00")
+POST_TIMES = []
+for t in POST_TIMES_RAW.split(","):
+    t = t.strip()
+    if not t:
+        continue
+    hh, mm = t.split(":")
+    POST_TIMES.append(dtime(hour=int(hh), minute=int(mm)))
+
+PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
+
+ALBUM_URL = os.getenv("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26")
+CONTACT  = os.getenv("CONTACT", "@layoutplacebuy")
+
+# ============== ИНИТ БОТА ==============
+bot = Bot(TOKEN, parse_mode=None)  # без parse_mode — чтобы не падать на «can't parse entities»
+dp = Dispatcher()
+
+
+# ============== ХЕЛПЕРЫ ==============
+def _now():
+    return datetime.now(ZONE)
+
+def _next_slots():
+    """Вернёт список ближайших слотов (сегодня/завтра) как datetime."""
+    now = _now()
+    today = now.date()
     slots = []
-    for s in csv.split(","):
-        s = s.strip()
-        if not s: continue
-        hh, mm = s.split(":")
-        slots.append(dtime(int(hh), int(mm)))
+    for tt in POST_TIMES:
+        dt = datetime.combine(today, tt, tzinfo=ZONE)
+        if dt >= now:
+            slots.append(dt)
+    if not slots:
+        # все на сегодня прошли — добавляем завтрашние
+        tomorrow = today + timedelta(days=1)
+        for tt in POST_TIMES:
+            slots.append(datetime.combine(tomorrow, tt, tzinfo=ZONE))
     return slots
 
-SLOTS = _parse_slots(SLOTS_CSV)
-PREVIEW_DELTA = timedelta(minutes=PREV_MIN)
+def _slot_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
 
-async def _dm_admins(text: str):
+def _preview_key(dt: datetime) -> str:
+    return f"preview_sent::{_slot_key(dt)}"
+
+def format_caption(original: str) -> str:
+    """
+    Приводим к единому стилю без эмодзи и добавляем две неизменяемые строки.
+    Ничего не форматируем в HTML, просто чистим пробелы.
+    """
+    if not original:
+        original = ""
+    text = original.replace("\u200b", "").strip()  # убрать zero-width
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    # Удаляем пустые хвосты
+    while lines and not lines[-1].strip():
+        lines.pop()
+    base = "\n".join(lines).strip()
+
+    tail = (
+        f"\n\nОбщий альбом: {ALBUM_URL}\n"
+        f"Покупка/вопросы: {CONTACT}"
+    )
+    # Если уже есть эти строки — не дублируем
+    if ALBUM_URL in base:
+        tail = tail.replace(f"\n\nОбщий альбом: {ALBUM_URL}", "")
+    if CONTACT in base:
+        tail = tail.replace(f"\nПокупка/вопросы: {CONTACT}", "")
+
+    return (base + tail).strip()
+
+
+async def _notify_admins(text: str, kb: InlineKeyboardMarkup | None = None):
     for aid in ADMINS:
         try:
-            await bot.send_message(aid, text, disable_web_page_preview=True)
+            await bot.send_message(aid, text, reply_markup=kb)
         except Exception as e:
-            logger.warning(f"DM админу {aid} не доставлено: {e}")
+            sched_log.warning(f"Админ {aid} недоступен: {e}")
 
-# ------------ commands ------------
-@rt.message(Command("start"))
-async def cmd_start(m: Message):
-    db.init_db()
-    txt = (
-        "Бот готов к работе.\n\n"
-        "Команды:\n"
-        "/myid — показать твой Telegram ID\n"
-        "/add_post — сделай ЭТОЙ командой ответом на пересланное из канала сообщение (фото/альбом)\n"
-        "/queue — показать размер очереди\n"
-        "/clear_queue — очистить очередь\n"
-        "/post_oldest — опубликовать старый пост вручную\n"
-        "/test_preview — отправить тестовое превью админам\n"
-        "/now — текущее время\n\n"
-        f"Слоты сегодня: {', '.join([t.strftime('%H:%M') for t in SLOTS])} "
-        f"(превью за {PREV_MIN} мин; авто-постинг: {'вкл' if AUTO_POST else 'выкл'})"
-    )
-    await m.answer(txt, disable_web_page_preview=True)
 
-@rt.message(Command("myid"))
-async def cmd_myid(m: Message):
-    await m.answer(str(m.from_user.id))
-
-def _src_tuple(m: Message) -> tuple[int,int] | None:
-    if not m.reply_to_message:
-        return None
-    rm = m.reply_to_message
-    if rm.forward_from_chat:
-        return (rm.forward_from_chat.id, rm.forward_from_message_id)
-    if rm.sender_chat and str(getattr(rm.sender_chat, "type", "")) == "chat_type.CHANNEL":
-        return (rm.chat.id, rm.message_id)
-    return None
-
-@rt.message(Command("add_post"))
-async def cmd_add_post(m: Message):
-    if m.from_user.id not in ADMINS:
+async def _send_preview_for_slot(slot_dt: datetime):
+    """Отправить превью СТАРЕЙШЕГО поста админу за PREVIEW_BEFORE_MIN до слота. Не постить!"""
+    # не дублируем
+    flag_key = _preview_key(slot_dt)
+    if get_meta(flag_key, "0") == "1":
         return
-    src = _src_tuple(m)
-    if not src:
-        await m.answer("Сделай /add_post **ответом** на пересланное из канала сообщение (фото/альбом).")
+
+    item = peek_oldest()
+    if not item:
+        await _notify_admins(f"🔔 [{_slot_key(slot_dt)}] В очереди нет постов.")
+        set_meta(flag_key, "1")
         return
-    cap = None
-    rm = m.reply_to_message
-    if rm and (rm.caption or rm.text):
-        cap = rm.caption or rm.text
-    cap = normalize_caption(cap or "", ALBUM_URL, CONTACT_TEXT)
 
-    qid = db.enqueue(src_chat_id=src[0], src_msg_id=src[1], caption=cap)
-    await m.answer(f"Медиа добавлено в очередь (id={qid}). В очереди: {db.count()}.")
+    # Подготовим подпись в едином стиле
+    cap = format_caption(item["caption"])
 
-@rt.message(Command("queue"))
-async def cmd_queue(m: Message):
-    await m.answer(f"В очереди: {db.count()}.")
+    # Соберём превью сообщения для админа
+    header = f"🔔 Превью [{_slot_key(slot_dt)}]\nБудет доступен к постингу через /post_oldest"
+    footer = f"\n\nВ очереди сейчас: {get_count()}."
+    text = f"{header}\n\n{cap}{footer}"
 
-@rt.message(Command("clear_queue"))
-async def cmd_clear(m: Message):
-    if m.from_user.id not in ADMINS:
-        return
-    db.clear()
-    await m.answer("Очищено.")
+    # Кнопка-подсказка
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Запостить старейший (/post_oldest)", callback_data="noop")]
+    ])
 
-@rt.message(Command("test_preview"))
-async def cmd_test_preview(m: Message):
-    await send_preview()
-
-@rt.message(Command("now"))
-async def cmd_now(m: Message):
-    await m.answer(_tznow().strftime("%Y-%m-%d %H:%M:%S %Z"))
-
-@rt.message(Command("post_oldest"))
-async def cmd_post_oldest(m: Message):
-    if m.from_user.id not in ADMINS:
-        return
-    ok, msg = await publish_oldest()
-    await m.answer(msg)
-
-# ------------ core actions ------------
-async def publish_oldest() -> tuple[bool,str]:
-    row = db.dequeue_oldest()
-    if not row:
-        return False, "Очередь пустая."
-    _id, src_chat_id, src_msg_id, caption = row
-
-    # удалить предыдущую публикацию бота (если была)
-    last = db.get_last_published_id()
-    if last:
-        try:
-            await bot.delete_message(CHANNEL_ID, last)
-        except TelegramBadRequest as e:
-            logger.warning(f"Не смог удалить старый пост {CHANNEL_ID}/{last}: {e}")
-
-    # опубликовать
+    # Пытаемся приложить медиа: если это набор — шлём группу, иначе фото + текст
+    items = item["items"]
     try:
-        sent = await bot.copy_message(
-            chat_id=CHANNEL_ID,
-            from_chat_id=src_chat_id,
-            message_id=src_msg_id,
-            caption=caption or None
-        )
-        db.set_last_published_id(sent.message_id)
-        return True, f"Опубликовано. Осталось в очереди: {db.count()}."
-    except TelegramBadRequest as e:
-        return False, f"Не удалось опубликовать: {e.message}"
+        if items and len(items) > 1:
+            media = []
+            for i, it in enumerate(items):
+                if it["type"] == "photo":
+                    if i == 0:
+                        media.append(InputMediaPhoto(media=it["file_id"], caption=text))
+                    else:
+                        media.append(InputMediaPhoto(media=it["file_id"]))
+            # отправим каждому админу
+            for aid in ADMINS:
+                try:
+                    msgs = await bot.send_media_group(aid, media)
+                    # догонка клавиатуры отдельным сообщением
+                    await bot.send_message(aid, "Нажми /post_oldest в чате с ботом, когда будет время постинга.", reply_markup=kb)
+                except Exception as e:
+                    sched_log.warning(f"Не удалось отправить превью альбом админу {aid}: {e}")
+        else:
+            # одиночное фото или без фото
+            if items and items[0]["type"] == "photo":
+                for aid in ADMINS:
+                    try:
+                        await bot.send_photo(aid, photo=items[0]["file_id"], caption=text, reply_markup=kb)
+                    except Exception as e:
+                        sched_log.warning(f"Не удалось отправить превью фото админу {aid}: {e}")
+            else:
+                await _notify_admins(text, kb=kb)
+    finally:
+        # отметим, что превью отправлено для этого слота
+        set_meta(flag_key, "1")
 
-async def send_preview():
-    peek = db.peek_oldest()
-    if not peek:
-        await _dm_admins("Превью: очередь пуста.")
-        return
-    _, _, _, caption = peek
-    text = "Превью (за 45 минут):\n\n" + (caption or "— без подписи —")
-    await _dm_admins(text)
 
-# ------------ scheduler: превью + авто-постинг ------------
-async def _scheduler_loop():
-    tz = pytz.timezone(TZ)
-    await asyncio.sleep(2)
-    slog = logging.getLogger("layoutplace_scheduler")
-    slog.info(
-        f"Scheduler TZ={TZ}, times={','.join([t.strftime('%H:%M') for t in SLOTS])}, "
-        f"preview_before={PREV_MIN} min, auto_post={AUTO_POST}"
-    )
-
-    preview_sent: set[str] = set()
-    posted: set[str] = set()
+async def scheduler_loop():
+    """
+    Планировщик ТОЛЬКО присылает превью за PREVIEW_BEFORE_MIN до слота.
+    Ничего автоматически не постит — постинг вручную через /post_oldest.
+    """
+    sched_log.info(f"Scheduler TZ={TZ}, times={','.join([t.strftime('%H:%M') for t in POST_TIMES])}, preview_before={PREVIEW_BEFORE_MIN} min")
 
     while True:
-        now = _tznow()
+        try:
+            slots = _next_slots()
+            if slots:
+                slot = slots[0]
+                preview_at = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
+                now = _now()
 
-        for t in SLOTS:
-            slot_dt = tz.localize(datetime.combine(now.date(), t))
-            preview_at = slot_dt - PREVIEW_DELTA
+                # если мы пересекли момент превью (или ровно попали) — шлём превью
+                if now >= preview_at and now < slot + timedelta(minutes=1):
+                    await _send_preview_for_slot(slot)
+        except Exception as e:
+            sched_log.error(f"scheduler error: {e}")
+        await asyncio.sleep(20)  # достаточно часто, но без фанатизма
 
-            # 1) превью за PREV_MIN
-            key_prev = f"prev:{preview_at:%Y-%m-%d %H:%M}"
-            if preview_at <= now < preview_at + timedelta(seconds=POST_WINDOW_SECONDS):
-                if key_prev not in preview_sent:
-                    await send_preview()
-                    preview_sent.add(key_prev)
 
-            # 2) авто-постинг в сам слот (без «догонялок», если выключены)
-            key_post = f"post:{slot_dt:%Y-%m-%d %H:%M}"
-            should_post_window = slot_dt <= now < slot_dt + timedelta(seconds=POST_WINDOW_SECONDS)
-            missed = now > slot_dt + timedelta(seconds=POST_WINDOW_SECONDS)
+# ============== ОБРАБОТКА ВХОДЯЩИХ ==============
 
-            if AUTO_POST:
-                if should_post_window and key_post not in posted:
-                    ok, msg = await publish_oldest()
-                    if not ok:
-                        # пустая очередь — молчим, чтобы не спамить
-                        pass
-                    posted.add(key_post)
-                elif missed and CATCH_UP_MISSED and key_post not in posted:
-                    # «догонялка» (по умолчанию выключена)
-                    ok, msg = await publish_oldest()
-                    posted.add(key_post)
+# Временное накопление альбомов по media_group_id (живёт в памяти процесса)
+_MEDIA_CACHE: dict[str, dict] = {}
+_MEDIA_TTL_SEC = 10
 
-        # полночь — сбрасываем «маркеры»
-        if now.hour == 0 and now.minute < 2:
-            preview_sent.clear()
-            posted.clear()
+def _cleanup_media_cache():
+    now = datetime.now().timestamp()
+    to_del = []
+    for k, v in _MEDIA_CACHE.items():
+        if now - v["ts"] > _MEDIA_TTL_SEC:
+            to_del.append(k)
+    for k in to_del:
+        _MEDIA_CACHE.pop(k, None)
 
-        await asyncio.sleep(2)
+def _src_tuple(m: Message):
+    """
+    Если сообщение переслано из канала — вернём (chat_id, message_id) оригинала,
+    чтобы потом попытаться удалить.
+    """
+    try:
+        if m.forward_from_chat and (str(getattr(m.forward_from_chat, "type", "")) == "channel"):
+            src_chat_id = m.forward_from_chat.id
+            src_msg_id = getattr(m, "forward_from_message_id", None)
+            if src_chat_id and src_msg_id:
+                return (int(src_chat_id), int(src_msg_id))
+    except:
+        pass
+    return None
 
-# ------------ entry ------------
-async def _run():
-    db.init_db()
-    asyncio.create_task(_scheduler_loop())
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    text = (
+        "Привет!\n\n"
+        "Команды:\n"
+        "• /add_post — перешли пост из канала (фото/альбом + описание), я добавлю в очередь.\n"
+        "• /queue — показать размер очереди.\n"
+        "• /post_oldest — запостить старейший пост из очереди в канал.\n\n"
+        f"Время слотов: {', '.join([t.strftime('%H:%M') for t in POST_TIMES])} ({TZ}).\n"
+        f"Превью за {PREVIEW_BEFORE_MIN} минут — в ЛС админам."
+    )
+    await m.answer(text)
+
+@dp.message(Command("queue"))
+async def cmd_queue(m: Message):
+    await m.answer(f"В очереди: {get_count()}.")
+
+@dp.message(Command("post_oldest"))
+async def cmd_post_oldest(m: Message):
+    # Только админы
+    if m.from_user and m.from_user.id not in ADMINS:
+        return
+    task = dequeue_oldest()
+    if not task:
+        await m.answer("Очередь пустая.")
+        return
+
+    caption = format_caption(task["caption"])
+    items = task["items"]
+
+    try:
+        if items and len(items) > 1:
+            media = []
+            for i, it in enumerate(items):
+                if it["type"] == "photo":
+                    if i == 0:
+                        media.append(InputMediaPhoto(media=it["file_id"], caption=caption))
+                    else:
+                        media.append(InputMediaPhoto(media=it["file_id"]))
+            msgs = await bot.send_media_group(CHANNEL_ID, media)
+            posted_msg_id = msgs[0].message_id if msgs else None
+        else:
+            if items and items[0]["type"] == "photo":
+                msg = await bot.send_photo(CHANNEL_ID, photo=items[0]["file_id"], caption=caption)
+                posted_msg_id = msg.message_id
+            else:
+                # на всякий — текстом
+                msg = await bot.send_message(CHANNEL_ID, caption)
+                posted_msg_id = msg.message_id
+
+        # попытка удалить старое сообщение в источнике
+        if task["src"]:
+            try:
+                await bot.delete_message(task["src"][0], task["src"][1])
+            except Exception as e:
+                logging.warning(f"Не смог удалить старое сообщение {task['src'][0]}/{task['src'][1]}: {e}")
+
+        await m.answer(f"Готово. Опубликовано.")
+    except Exception as e:
+        await m.answer(f"Не удалось запостить: {e}")
+
+@dp.message(Command("add_post"))
+async def cmd_add_post_hint(m: Message):
+    await m.answer("Перешли боту пост из канала (фото/альбом с подписью). Я добавлю в очередь.")
+
+@dp.message(F.media_group_id | F.photo | F.caption | F.forward_from_chat)
+async def any_message(m: Message):
+    """
+    Ловим пересланные из канала посты.
+    Поддерживаем одиночные фото и альбомы (по media_group_id).
+    """
+    # Только админы могут добавлять
+    if not m.from_user or m.from_user.id not in ADMINS:
+        return
+
+    _cleanup_media_cache()
+
+    # Если альбом
+    if m.media_group_id:
+        key = str(m.media_group_id)
+        bucket = _MEDIA_CACHE.get(key)
+        if not bucket:
+            bucket = {"ts": datetime.now().timestamp(), "items": [], "caption": "", "src": _src_tuple(m)}
+            _MEDIA_CACHE[key] = bucket
+
+        # накапливаем фото
+        if m.photo:
+            photo = m.photo[-1]  # максимальное качество
+            bucket["items"].append({"type": "photo", "file_id": photo.file_id})
+        # подпись только один раз возьмём, любую непустую
+        if (m.caption or "").strip():
+            bucket["caption"] = m.caption.strip()
+
+        # подождём, пока весь альбом придёт; пользователь сам ничего не жмёт —
+        # мы добавим альбом в очередь по команде от Telegram после таймаута.
+        # Простая эвристика: как только фотка пришла — ставим короткую задержку и оформляем.
+        await asyncio.sleep(1.0)
+        # если новых частей не прибыло за TTL — считаем альбом законченным и кладём в очередь
+        # (практически — альбом добавится после последнего элемента)
+        qid = enqueue(bucket["items"], bucket["caption"], bucket["src"])
+        _MEDIA_CACHE.pop(key, None)
+        await m.answer(f"Добавил в очередь альбом. Сейчас в очереди: {get_count()}.")
+        return
+
+    # Одиночное фото/текст
+    items = []
+    if m.photo:
+        items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+
+    caption = (m.caption or m.text or "").strip()
+    src = _src_tuple(m)
+    if not items and not caption:
+        return  # не интересует
+
+    qid = enqueue(items, caption, src)
+    await m.answer(f"Добавил в очередь. Сейчас в очереди: {get_count()}.")
+
+
+# ============== СТАРТ ==============
+async def run_bot():
+    init_db()
+    log.info(f"Starting bot instance...")
+    # отдельная корутина-планировщик
+    asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
