@@ -1,149 +1,141 @@
-import json
-import sqlite3
-import time
-from typing import List, Optional, Tuple, Dict, Any
+import sqlite3, json, time, logging
+from typing import List, Dict, Optional, Tuple
 from config import DB_PATH
 
+log = logging.getLogger("db")
+
 def _connect():
-    cx = sqlite3.connect(DB_PATH, check_same_thread=False)
+    cx = sqlite3.connect(DB_PATH)
     cx.row_factory = sqlite3.Row
     return cx
 
-def _columns(cx: sqlite3.Connection, table: str) -> set[str]:
-    cur = cx.execute(f"PRAGMA table_info({table})")
-    return {row[1] for row in cur.fetchall()}
-
-def _ensure_queue_schema(cx: sqlite3.Connection):
-    cur = cx.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT
-        )
-    """)
-    existing = _columns(cx, "queue")
-
-    # актуальные поля
-    need = [
-        ("items_json", "TEXT", None),
-        ("caption", "TEXT", None),
-        ("src_chat_id", "INTEGER", None),
-        ("src_msg_id", "INTEGER", None),
-        ("created_at", "INTEGER", 0),
-    ]
-    for name, typ, default in need:
-        if name not in existing:
-            if default is None:
-                cur.execute(f"ALTER TABLE queue ADD COLUMN {name} {typ}")
-            else:
-                cur.execute(f"ALTER TABLE queue ADD COLUMN {name} {typ} DEFAULT {default}")
-
-    # если есть старые поля — мягко обрабатываем их существование
-    # (например, legacy: payload NOT NULL)
-    cx.commit()
-
-def _ensure_albums_cache_schema(cx: sqlite3.Connection):
-    cur = cx.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS albums_cache (
-            media_group_id TEXT PRIMARY KEY,
-            items_json     TEXT NOT NULL,
-            updated_at     INTEGER NOT NULL
-        )
-    """)
-    cx.commit()
+def _table_info_has(col_names, name):
+    return any(c["name"] == name for c in col_names)
 
 def init_db():
     cx = _connect()
     try:
-        _ensure_queue_schema(cx)
-        _ensure_albums_cache_schema(cx)
+        cur = cx.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='queue'")
+        exists = cur.fetchone() is not None
+        if not exists:
+            cx.execute("""
+                CREATE TABLE queue(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    items_json TEXT NOT NULL,
+                    caption TEXT,
+                    src_chat_id INTEGER,
+                    src_msg_id INTEGER,
+                    created_at INTEGER
+                )
+            """)
+            cx.execute("""
+                CREATE TABLE IF NOT EXISTS meta(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            cx.commit()
+            return
+
+        # миграция со старой схемы (payload -> items_json)
+        info = cx.execute("PRAGMA table_info(queue)").fetchall()
+        names = [dict(r) for r in info]
+        if _table_info_has(names, "payload") and not _table_info_has(names, "items_json"):
+            log.warning("DB migrate: payload -> items_json")
+            cx.execute("ALTER TABLE queue RENAME TO queue_old")
+            cx.execute("""
+                CREATE TABLE queue(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    items_json TEXT NOT NULL,
+                    caption TEXT,
+                    src_chat_id INTEGER,
+                    src_msg_id INTEGER,
+                    created_at INTEGER
+                )
+            """)
+            # переливаем
+            old = cx.execute("SELECT id, payload, caption, src_chat_id, src_msg_id, created_at FROM queue_old")
+            for r in old:
+                items = json.loads(r["payload"]) if r["payload"] else []
+                cx.execute("""
+                    INSERT INTO queue(id, items_json, caption, src_chat_id, src_msg_id, created_at)
+                    VALUES(?,?,?,?,?,?)
+                """, (r["id"], json.dumps(items), r["caption"], r["src_chat_id"], r["src_msg_id"], r["created_at"]))
+            cx.execute("DROP TABLE queue_old")
+            cx.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+            cx.commit()
     finally:
         cx.close()
-
-# ---------- Albums cache ----------
-def cache_album_upsert(media_group_id: str, items: List[Dict[str, Any]]):
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("""
-        INSERT INTO albums_cache(media_group_id, items_json, updated_at)
-        VALUES(?,?,?)
-        ON CONFLICT(media_group_id) DO UPDATE SET
-            items_json = excluded.items_json,
-            updated_at = excluded.updated_at
-    """, (media_group_id, json.dumps(items), int(time.time())))
-    cx.commit()
-    cx.close()
-
-def cache_album_get(media_group_id: str) -> Optional[List[Dict[str, Any]]]:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT items_json FROM albums_cache WHERE media_group_id = ?", (media_group_id,))
-    row = cur.fetchone()
-    cx.close()
-    if not row:
-        return None
-    return json.loads(row[0])
-
-def cache_album_clear():
-    cx = _connect()
-    cx.execute("DELETE FROM albums_cache")
-    cx.commit()
-    cx.close()
-
-# ---------- Queue API ----------
-def _has_payload_column() -> bool:
-    cx = _connect()
-    try:
-        cols = _columns(cx, "queue")
-        return "payload" in cols
-    finally:
-        cx.close()
-
-def enqueue(items: List[Dict[str, Any]], caption: str = "", src: Optional[Tuple[int, int]] = None) -> int:
-    src_chat_id, src_msg_id = (src or (None, None))
-    cx = _connect()
-    cur = cx.cursor()
-    items_json = json.dumps(items)
-    if _has_payload_column():
-        # Легаси-таблица требует payload NOT NULL — кладём пустую строку
-        cur.execute("""
-            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at, payload)
-            VALUES(?,?,?,?,?,?)
-        """, (items_json, caption, src_chat_id, src_msg_id, int(time.time()), ""))
-    else:
-        cur.execute("""
-            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
-            VALUES(?,?,?,?,?)
-        """, (items_json, caption, src_chat_id, src_msg_id, int(time.time())))
-    qid = cur.lastrowid
-    cx.commit()
-    cx.close()
-    return qid
-
-def dequeue_oldest() -> Optional[Dict[str, Any]]:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT id, items_json, caption, src_chat_id, src_msg_id FROM queue ORDER BY id LIMIT 1")
-    row = cur.fetchone()
-    if not row:
-        cx.close()
-        return None
-    qid, items_json, caption, src_chat_id, src_msg_id = row
-    cur.execute("DELETE FROM queue WHERE id = ?", (qid,))
-    cx.commit()
-    cx.close()
-    return {
-        "id": qid,
-        "items": json.loads(items_json) if items_json else [],
-        "caption": caption or "",
-        "src_chat_id": src_chat_id,
-        "src_msg_id": src_msg_id,
-    }
 
 def get_count() -> int:
     cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT COUNT(*) FROM queue")
-    c = int(cur.fetchone()[0])
-    cx.close()
-    return c
+    try:
+        return cx.execute("SELECT COUNT(*) FROM queue").fetchone()[0]
+    finally:
+        cx.close()
+
+def enqueue(items: List[Dict], caption: str, src: Optional[Tuple[int,int]]) -> int:
+    src_chat_id, src_msg_id = (src or (None, None))
+    cx = _connect()
+    try:
+        cur = cx.execute("""
+            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
+            VALUES(?,?,?,?,?)
+        """, (json.dumps(items), caption, src_chat_id, src_msg_id, int(time.time())))
+        cx.commit()
+        return cur.lastrowid
+    finally:
+        cx.close()
+
+def dequeue_oldest():
+    cx = _connect()
+    try:
+        row = cx.execute("""
+            SELECT id, items_json, caption, src_chat_id, src_msg_id
+            FROM queue ORDER BY id LIMIT 1
+        """).fetchone()
+        if not row:
+            return None
+        cx.execute("DELETE FROM queue WHERE id=?", (row["id"],))
+        cx.commit()
+        return {
+            "id": row["id"],
+            "items": json.loads(row["items_json"]) if row["items_json"] else [],
+            "caption": row["caption"] or "",
+            "src": (row["src_chat_id"], row["src_msg_id"]) if row["src_chat_id"] else None,
+        }
+    finally:
+        cx.close()
+
+def peek_oldest():
+    cx = _connect()
+    try:
+        row = cx.execute("""
+            SELECT id, items_json, caption FROM queue ORDER BY id LIMIT 1
+        """).fetchone()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "items": json.loads(row["items_json"]) if row["items_json"] else [],
+            "caption": row["caption"] or "",
+        }
+    finally:
+        cx.close()
+
+def meta_get(key: str) -> Optional[str]:
+    cx = _connect()
+    try:
+        r = cx.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else None
+    finally:
+        cx.close()
+
+def meta_set(key: str, value: str):
+    cx = _connect()
+    try:
+        cx.execute("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, value))
+        cx.commit()
+    finally:
+        cx.close()
