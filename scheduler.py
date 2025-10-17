@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 
 from config import TZ, TIMES, PREVIEW_BEFORE_MIN, ADMINS, CHANNEL_ID
@@ -12,6 +13,7 @@ from utils.text import build_caption
 
 tz = ZoneInfo(TZ)
 
+
 def _today_slots() -> list[datetime]:
     today = datetime.now(tz).date()
     slots = []
@@ -19,6 +21,7 @@ def _today_slots() -> list[datetime]:
         hh, mm = map(int, t.split(":"))
         slots.append(datetime(today.year, today.month, today.day, hh, mm, tzinfo=tz))
     return slots
+
 
 def _next_slot() -> datetime:
     now = datetime.now(tz)
@@ -31,13 +34,43 @@ def _next_slot() -> datetime:
     tomorrow = now.date() + timedelta(days=1)
     return datetime(tomorrow.year, tomorrow.month, tomorrow.day, hh, mm, tzinfo=tz)
 
-async def _send_preview(bot: Bot):
-    text = "Тестовое превью\nПост был бы тут за 45 минут до публикации."
+
+def _build_channel_link(channel_id_or_username: str, msg_id: int) -> str:
+    """
+    Возвращает ссылку на сообщение в канале:
+    - публичный канал:   https://t.me/<username>/<msg_id>
+    - приватный канал:   https://t.me/c/<internal>/<msg_id>, где internal = abs(chat_id) без префикса -100
+    """
+    if isinstance(channel_id_or_username, str) and channel_id_or_username.startswith("@"):
+        return f"https://t.me/{channel_id_or_username[1:]}/{msg_id}"
+    # numeric chat_id
+    try:
+        cid = int(channel_id_or_username)
+    except Exception:
+        # вдруг передали '-100...' как строку
+        try:
+            cid = int(str(channel_id_or_username))
+        except Exception:
+            return str(channel_id_or_username)
+
+    internal = str(abs(cid))
+    if internal.startswith("100"):
+        internal = internal[3:]
+    return f"https://t.me/c/{internal}/{msg_id}"
+
+
+async def _notify_admins(bot: Bot, text: str):
     for aid in ADMINS:
         try:
-            await bot.send_message(aid, text)
+            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as e:
-            logging.warning(f"Не смог отправить превью админу {aid}: {e}")
+            logging.warning(f"Админ {aid} недоступен: {e}")
+
+
+async def _send_preview(bot: Bot):
+    text = "Превью: через ~45 минут будет публикация очередного поста."
+    await _notify_admins(bot, text)
+
 
 async def _publish(bot: Bot, task: dict):
     """
@@ -46,7 +79,7 @@ async def _publish(bot: Bot, task: dict):
     caption = build_caption(task.get("caption") or "")
     items = task["items"]
 
-    # 1) постинг
+    # 1) публикация
     try:
         if len(items) == 1:
             it = items[0]
@@ -75,15 +108,27 @@ async def _publish(bot: Bot, task: dict):
             await bot.send_media_group(CHANNEL_ID, media)
     except TelegramBadRequest as e:
         logging.error(f"Ошибка постинга: {e}")
-        # не удаляем оригинал, продолжаем
-    # 2) попытка удалить старый пост в канале
+
+    # 2) попытка удалить старый пост
     src_chat_id = task.get("src_chat_id")
     src_msg_id = task.get("src_msg_id")
     if src_chat_id and src_msg_id:
         try:
             await bot.delete_message(src_chat_id, src_msg_id)
+        except TelegramBadRequest as e:
+            # Частый кейс: бот НЕ автор старого поста в канале — Telegram не даёт удалить.
+            link = _build_channel_link(str(CHANNEL_ID if str(src_chat_id).startswith("-100") else src_chat_id), src_msg_id)
+            logging.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {e}")
+            await _notify_admins(
+                bot,
+                (
+                    "Не удалось удалить старый пост (ограничение Telegram — бот может удалять только свои сообщения).\n"
+                    f"Пожалуйста, удалите вручную: {link}"
+                ),
+            )
         except Exception as e:
             logging.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {e}")
+
 
 async def run_scheduler(bot: Bot):
     """
@@ -99,6 +144,7 @@ async def run_scheduler(bot: Bot):
         try:
             nxt = _next_slot()
             now = datetime.now(tz)
+
             # превью
             if (nxt - now) <= timedelta(minutes=PREVIEW_BEFORE_MIN):
                 key = nxt.strftime("%Y-%m-%d %H:%M")
@@ -106,13 +152,11 @@ async def run_scheduler(bot: Bot):
                     await _send_preview(bot)
                     preview_sent_for.add(key)
 
-            # публикация ровно в слот
+            # публикация в слот
             if now >= nxt:
-                # публикуем 1 элемент из очереди
                 task = dequeue_oldest()
                 if task:
                     await _publish(bot, task)
-                # небольшой слип, чтобы не опрашивать слишком часто
                 await asyncio.sleep(2)
 
             await asyncio.sleep(5)
