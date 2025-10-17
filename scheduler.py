@@ -1,165 +1,171 @@
+# scheduler.py
+import os
 import asyncio
 import logging
+from typing import List, Tuple, Optional
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InputMediaPhoto, InputMediaVideo
 
-from config import TZ, TIMES, PREVIEW_BEFORE_MIN, ADMINS, CHANNEL_ID
-from storage.db import init_db, get_count, dequeue_oldest
-from utils.text import build_caption
+# конфиг
+try:
+    from config import TOKEN, CHANNEL_ID, ADMINS, TZ, POST_TIMES, PREVIEW_MINUTES
+except Exception:
+    TOKEN = os.getenv("BOT_TOKEN", "")
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1000000000000"))
+    ADMINS = [int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x]
+    TZ = os.getenv("TZ", "Europe/Moscow")
+    POST_TIMES = os.getenv("POST_TIMES", "12:00,16:00,20:00")
+    PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
 
-tz = ZoneInfo(TZ)
+from storage.db import (
+    init_db,
+    get_count,
+    peek_oldest,
+    dequeue_oldest,
+)
 
+log = logging.getLogger("layoutplace_scheduler")
 
-def _today_slots() -> list[datetime]:
-    today = datetime.now(tz).date()
-    slots = []
-    for t in TIMES:
-        hh, mm = map(int, t.split(":"))
-        slots.append(datetime(today.year, today.month, today.day, hh, mm, tzinfo=tz))
-    return slots
+def _parse_times(s: str) -> List[Tuple[int,int]]:
+    out = []
+    for chunk in s.split(","):
+        t = chunk.strip()
+        if not t:
+            continue
+        hh, mm = t.split(":")
+        out.append((int(hh), int(mm)))
+    return out
 
+TZINFO = ZoneInfo(TZ)
+SLOTS: List[Tuple[int,int]] = _parse_times(POST_TIMES)
 
-def _next_slot() -> datetime:
-    now = datetime.now(tz)
-    slots = sorted(_today_slots())
-    for s in slots:
-        if s > now:
-            return s
-    # если все прошли — первый слот завтра
-    hh, mm = map(int, TIMES[0].split(":"))
-    tomorrow = now.date() + timedelta(days=1)
-    return datetime(tomorrow.year, tomorrow.month, tomorrow.day, hh, mm, tzinfo=tz)
+# Чтобы не слать дубли в рамках одного запуска
+_sent_preview_keys = set()
+_done_post_keys = set()
+_last_day_key: Optional[str] = None
 
+def _day_key(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
 
-def _build_channel_link(channel_id_or_username: str, msg_id: int) -> str:
-    """
-    Возвращает ссылку на сообщение в канале:
-    - публичный канал:   https://t.me/<username>/<msg_id>
-    - приватный канал:   https://t.me/c/<internal>/<msg_id>, где internal = abs(chat_id) без префикса -100
-    """
-    if isinstance(channel_id_or_username, str) and channel_id_or_username.startswith("@"):
-        return f"https://t.me/{channel_id_or_username[1:]}/{msg_id}"
-    # numeric chat_id
-    try:
-        cid = int(channel_id_or_username)
-    except Exception:
-        # вдруг передали '-100...' как строку
-        try:
-            cid = int(str(channel_id_or_username))
-        except Exception:
-            return str(channel_id_or_username)
-
-    internal = str(abs(cid))
-    if internal.startswith("100"):
-        internal = internal[3:]
-    return f"https://t.me/c/{internal}/{msg_id}"
-
+def _slot_key(dt: datetime, hh: int, mm: int) -> str:
+    return f"{dt.strftime('%Y-%m-%d')} {hh:02d}:{mm:02d}"
 
 async def _notify_admins(bot: Bot, text: str):
-    for aid in ADMINS:
+    for uid in ADMINS:
         try:
-            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await bot.send_message(uid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except Exception as e:
-            logging.warning(f"Админ {aid} недоступен: {e}")
+            log.warning(f"Админ {uid} недоступен: {e}")
 
+async def _post_one(bot: Bot):
+    task = dequeue_oldest()
+    if not task:
+        return False
 
-async def _send_preview(bot: Bot):
-    text = "Превью: через ~45 минут будет публикация очередного поста."
-    await _notify_admins(bot, text)
+    caption = task.get("caption") or ""
+    src = task.get("src")
+    items = task.get("items") or []
 
+    if src:
+        src_chat_id, src_msg_id = src
+        res = await bot.copy_message(
+            chat_id=CHANNEL_ID,
+            from_chat_id=src_chat_id,
+            message_id=src_msg_id,
+            caption=caption or None,
+            parse_mode=ParseMode.HTML,
+            disable_notification=False
+        )
+        # попытка удалить источник
+        try:
+            await bot.delete_message(chat_id=src_chat_id, message_id=src_msg_id)
+        except Exception as del_err:
+            log.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {del_err}")
+        return True
 
-async def _publish(bot: Bot, task: dict):
-    """
-    task = { id, items:[{type,file_id},...], caption, src_chat_id, src_msg_id }
-    """
-    caption = build_caption(task.get("caption") or "")
-    items = task["items"]
-
-    # 1) публикация
-    try:
-        if len(items) == 1:
-            it = items[0]
-            t = it["type"]
-            fid = it["file_id"]
-            if t == "photo":
-                await bot.send_photo(CHANNEL_ID, fid, caption=caption)
-            elif t == "video":
-                await bot.send_video(CHANNEL_ID, fid, caption=caption)
-            elif t == "document":
-                await bot.send_document(CHANNEL_ID, fid, caption=caption)
-            else:
-                await bot.send_message(CHANNEL_ID, caption or "(пустая подпись)")
-        else:
+    # items собранные
+    if items:
+        if len(items) > 1:
             media = []
-            from aiogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
-            for idx, it in enumerate(items):
-                t = it["type"]; fid = it["file_id"]
-                cap = caption if (idx == 0) else None
+            for i, it in enumerate(items):
+                t = it.get("type")
+                fid = it.get("file_id")
+                if not fid:
+                    continue
                 if t == "photo":
-                    media.append(InputMediaPhoto(media=fid, caption=cap))
+                    media.append(InputMediaPhoto(media=fid, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML))
                 elif t == "video":
-                    media.append(InputMediaVideo(media=fid, caption=cap))
-                elif t == "document":
-                    media.append(InputMediaDocument(media=fid, caption=cap))
-            await bot.send_media_group(CHANNEL_ID, media)
-    except TelegramBadRequest as e:
-        logging.error(f"Ошибка постинга: {e}")
+                    media.append(InputMediaVideo(media=fid, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML))
+            if media:
+                await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+                return True
+        else:
+            it = items[0]
+            t = it.get("type")
+            fid = it.get("file_id")
+            if t == "photo":
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=fid, caption=caption, parse_mode=ParseMode.HTML)
+            elif t == "video":
+                await bot.send_video(chat_id=CHANNEL_ID, video=fid, caption=caption, parse_mode=ParseMode.HTML)
+            else:
+                await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            return True
 
-    # 2) попытка удалить старый пост
-    src_chat_id = task.get("src_chat_id")
-    src_msg_id = task.get("src_msg_id")
-    if src_chat_id and src_msg_id:
-        try:
-            await bot.delete_message(src_chat_id, src_msg_id)
-        except TelegramBadRequest as e:
-            # Частый кейс: бот НЕ автор старого поста в канале — Telegram не даёт удалить.
-            link = _build_channel_link(str(CHANNEL_ID if str(src_chat_id).startswith("-100") else src_chat_id), src_msg_id)
-            logging.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {e}")
-            await _notify_admins(
-                bot,
-                (
-                    "Не удалось удалить старый пост (ограничение Telegram — бот может удалять только свои сообщения).\n"
-                    f"Пожалуйста, удалите вручную: {link}"
-                ),
-            )
-        except Exception as e:
-            logging.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {e}")
+    # просто текст
+    await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    return True
 
-
-async def run_scheduler(bot: Bot):
-    """
-    Вызывается из main._run() как background-task.
-    Следит за слотами, шлёт превью и публикует по времени.
-    """
-    logging.info(f"Scheduler TZ={TZ}, times={','.join(TIMES)}, preview_before={PREVIEW_BEFORE_MIN} min")
+async def run_scheduler():
     init_db()
+    bot = Bot(TOKEN)
+    log.info(f"Scheduler TZ={TZ}, times={POST_TIMES}, preview_before={PREVIEW_MINUTES} min")
 
-    preview_sent_for: set[str] = set()  # yyyy-mm-dd HH:MM
-
+    global _last_day_key, _sent_preview_keys, _done_post_keys
     while True:
-        try:
-            nxt = _next_slot()
-            now = datetime.now(tz)
+        now = datetime.now(TZINFO)
+        dk = _day_key(now)
+        if _last_day_key != dk:
+            # новый день — очищаем флаги
+            _sent_preview_keys.clear()
+            _done_post_keys.clear()
+            _last_day_key = dk
+
+        # если очередь пустая — просто спим
+        count = get_count()
+        if count == 0:
+            await asyncio.sleep(20)
+            continue
+
+        for hh, mm in SLOTS:
+            slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if slot < now - timedelta(hours=12):
+                # если почему-то «вчерашнее» — сместим на сегодня
+                slot = datetime(now.year, now.month, now.day, hh, mm, tzinfo=TZINFO)
+            key = _slot_key(now, hh, mm)
 
             # превью
-            if (nxt - now) <= timedelta(minutes=PREVIEW_BEFORE_MIN):
-                key = nxt.strftime("%Y-%m-%d %H:%M")
-                if key not in preview_sent_for:
-                    await _send_preview(bot)
-                    preview_sent_for.add(key)
-
-            # публикация в слот
-            if now >= nxt:
-                task = dequeue_oldest()
+            preview_at = slot - timedelta(minutes=PREVIEW_MINUTES)
+            if now >= preview_at and key not in _sent_preview_keys:
+                task = peek_oldest()
                 if task:
-                    await _publish(bot, task)
-                await asyncio.sleep(2)
+                    cap = (task.get("caption") or "").strip()
+                    src = task.get("src")
+                    kind = "репост из канала" if src else ("альбом" if (task.get("items") and len(task["items"]) > 1) else ("медиа" if task.get("items") else "текст"))
+                    await _notify_admins(
+                        bot,
+                        f"Предстоящий пост в {slot.strftime('%H:%M')} ({TZ}). Тип: {kind}\n\nПревью:\n{cap[:2000]}"
+                    )
+                _sent_preview_keys.add(key)
 
-            await asyncio.sleep(5)
-        except Exception as e:
-            logging.exception(f"Scheduler loop error: {e}")
-            await asyncio.sleep(5)
+            # публикация
+            if now >= slot and key not in _done_post_keys:
+                ok = await _post_one(bot)
+                if ok:
+                    await _notify_admins(bot, f"Опубликовано (слот {slot.strftime('%H:%M')}). Осталось в очереди: {get_count()}")
+                _done_post_keys.add(key)
+
+        await asyncio.sleep(20)
