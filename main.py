@@ -27,6 +27,38 @@ log = logging.getLogger("layoutplace_bot")
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# ====== Альбом-кэш (собираем фото media_group, TTL ~15 мин) ======
+ALBUM_CACHE: dict[tuple[int, str], list[str]] = {}   # (chat_id, media_group_id) -> [file_id,...]
+ALBUM_TTL_SEC = 15 * 60
+ALBUM_LAST_SEEN: dict[tuple[int, str], float] = {}
+
+async def _album_gc_loop():
+    while True:
+        now = time.time()
+        for key in list(ALBUM_LAST_SEEN.keys()):
+            if now - ALBUM_LAST_SEEN[key] > ALBUM_TTL_SEC:
+                ALBUM_LAST_SEEN.pop(key, None)
+                ALBUM_CACHE.pop(key, None)
+        await asyncio.sleep(30)
+
+@dp.message(F.media_group_id & (F.photo | F.document))
+async def on_album_piece(m: Message):
+    """Ловим любые сообщения с media_group_id, чтобы собрать все file_id альбома."""
+    mgid = m.media_group_id
+    key = (m.chat.id, mgid)
+    if key not in ALBUM_CACHE:
+        ALBUM_CACHE[key] = []
+    # берём file_id фото (или изображения в document)
+    if m.photo:
+        fid = m.photo[-1].file_id
+        if fid not in ALBUM_CACHE[key]:
+            ALBUM_CACHE[key].append(fid)
+    elif m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
+        fid = m.document.file_id
+        if fid not in ALBUM_CACHE[key]:
+            ALBUM_CACHE[key].append(fid)
+    ALBUM_LAST_SEEN[key] = time.time()
+
 # ------------- helpers -------------
 
 def tznow() -> datetime:
@@ -61,27 +93,33 @@ async def _send_to_channel(items: List[Dict], caption: str) -> int:
         msg = await bot.send_photo(CHANNEL_ID, it["file_id"], caption=caption)
         return msg.message_id
 
-def _collect_items_from_message(msg: Message) -> List[Dict]:
-    items: List[Dict] = []
-    # если это пересланное из канала фото/док
+def _items_from_message_or_album(msg: Message) -> List[Dict]:
+    """
+    Если ответ на сообщение из альбома (media_group_id) — берём все file_id из кэша,
+    иначе — одно фото из самого сообщения.
+    """
     m = msg.reply_to_message or msg
+    # 1) Пробуем кэш альбома
+    if m.media_group_id:
+        key = (msg.chat.id, m.media_group_id)
+        fids = ALBUM_CACHE.get(key, [])
+        if fids:
+            return [{"type": "photo", "file_id": fid} for fid in fids]
+    # 2) Одиночное фото/документ-картинка
     if m.photo:
-        # берём максимальный размер
-        items.append({"type": "photo", "file_id": m.photo[-1].file_id})
-    elif m.media_group_id and m.photo:
-        items.append({"type": "photo", "file_id": m.photo[-1].file_id})
-    elif m.document and m.document.mime_type.startswith("image/"):
-        items.append({"type": "photo", "file_id": m.document.file_id})
-    return items
+        return [{"type": "photo", "file_id": m.photo[-1].file_id}]
+    if m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
+        return [{"type": "photo", "file_id": m.document.file_id}]
+    return []
 
 def _src_tuple(msg: Message) -> Optional[Tuple[int,int]]:
     m = msg.reply_to_message
     if not m: 
         return None
-    # если пост реально из канала
+    # если пост реально из канала (пересланный)
     if m.forward_from_chat and (m.forward_from_chat.type.value == "channel"):
         return (m.forward_from_chat.id, m.forward_from_message_id)
-    # если это не forward, попробуем по чату/ид
+    # если это не forward, но находится в канале (редкий кейс)
     if m.chat and m.chat.type.value == "channel":
         return (m.chat.id, m.message_id)
     return None
@@ -113,7 +151,6 @@ async def cmd_queue(m: Message):
 
 @dp.message(Command("clear_queue"))
 async def cmd_clear(m: Message):
-    # примитивно — достаём всё
     removed = 0
     while dequeue_oldest():
         removed += 1
@@ -125,12 +162,12 @@ async def cmd_add_post(m: Message):
         await m.answer("Сделай /add_post ответом на пересланное из канала сообщение (фото/альбом).")
         return
 
-    items = _collect_items_from_message(m)
+    items = _items_from_message_or_album(m)
     if not items:
         await m.answer("Не нашёл фото. Пришли пересланный пост с фото/альбомом.")
         return
 
-    # caption берём из пересланного сообщения, если есть
+    # caption из пересланного (если есть) + нормализация
     src_msg = m.reply_to_message or m
     raw_caption = (src_msg.caption or "").strip()
     caption = normalize_caption(raw_caption)
@@ -144,9 +181,7 @@ async def cmd_post_oldest(m: Message):
     if not task:
         await m.answer("Очередь пуста.")
         return
-    # публикация
     new_msg_id = await _send_to_channel(task["items"], task["caption"])
-    # пробуем удалить источник
     if task["src"]:
         src_chat, src_msg = task["src"]
         try:
@@ -166,8 +201,16 @@ async def cmd_now(m: Message):
 
 # ------------- scheduler -------------
 
+def _today_slots() -> List[datetime]:
+    base = tznow().date()
+    out = []
+    for t in POST_TIMES:
+        hh, mm = [int(x) for x in t.strip().split(":")]
+        out.append(datetime(base.year, base.month, base.day, hh, mm, tzinfo=ZoneInfo(TZ)))
+    return out
+
 async def _catch_up_if_needed():
-    """При старте публикуем все пропущенные слоты сегодня (если очередь не пуста)."""
+    """При старте публикуем пропущенные слоты сегодня (если очередь не пуста)."""
     now = tznow()
     last_key = "last_slot_ts"
     last_ts = int(meta_get(last_key) or "0")
@@ -192,7 +235,7 @@ async def run_scheduler():
     await _catch_up_if_needed()
 
     last_key = "last_slot_ts"
-    preview_key = "preview_for_ts"   # чтобы превью ушло один раз
+    preview_key = "preview_for_ts"
 
     while True:
         now = tznow()
@@ -201,14 +244,12 @@ async def run_scheduler():
         for slot in _today_slots():
             preview_at = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
             if preview_at <= now < slot:
-                # отправим превью один раз на этот слот
                 if meta_get(preview_key) != str(int(slot.timestamp())):
                     peek = peek_oldest()
                     if peek:
+                        eta = (slot - now).seconds // 60
                         await _notify_admins(
-                            "Превью: следующий пост через "
-                            f"{(slot - now).seconds // 60} мин.\n\n"
-                            f"{peek['caption'][:500]}"
+                            f"Превью: следующий пост через {eta} мин.\n\n{peek['caption'][:500]}"
                         )
                     meta_set(preview_key, str(int(slot.timestamp())))
 
@@ -229,7 +270,6 @@ async def run_scheduler():
                     meta_set(last_key, str(int(slot.timestamp())))
                     log.info(f"Posted for slot {slot.isoformat()}")
                 else:
-                    # запомним, чтобы не крутиться бесконечно на пустой очереди
                     meta_set(last_key, str(int(slot.timestamp())))
         await asyncio.sleep(20)
 
@@ -237,7 +277,8 @@ async def run_scheduler():
 
 async def _run():
     init_db()
-    # запускаем планировщик параллельно с polling
+    # запускаем сборщик мусора альбомов и планировщик
+    asyncio.create_task(_album_gc_loop())
     asyncio.create_task(run_scheduler())
     await dp.start_polling(bot)
 
