@@ -49,7 +49,6 @@ def _collapse_blank_lines(lines: List[str]) -> List[str]:
 
 # ----------------- РАЗБОР ПОЛЕЙ -----------------
 
-# Нормализуем ключ поля к каноническому виду
 _FIELD_ALIASES: Dict[str, str] = {
     "размер": "Размер",
     "size": "Размер",
@@ -58,7 +57,6 @@ _FIELD_ALIASES: Dict[str, str] = {
     "цена": "Цена",
     "price": "Цена",
 }
-
 _FIELD_ORDER = ["Размер", "Состояние", "Цена"]
 
 _FIELD_LINE_RE = re.compile(
@@ -75,9 +73,12 @@ def _parse_field_line(ln: str) -> Optional[Tuple[str, str]]:
         return None
     val = m.group("val").strip()
     if key == "Цена":
-        val = _norm_dash(val)  # "3 200 ₽" / "3200 руб." и т.п.
-        return key, val
+        val = _norm_dash(val)
+        # уберём возможный дублирующий «Цена:» внутри значения
+        val = re.sub(r"^(цена|price)\s*[:\-—]?\s*", "", val, flags=re.I).strip()
     return key, val
+
+# ----------------- ХВОСТ -----------------
 
 def _ensure_tail(lines: List[str]) -> List[str]:
     had_album = any("Общий альбом:" in ln for ln in lines)
@@ -95,6 +96,30 @@ def _ensure_tail(lines: List[str]) -> List[str]:
         lines.extend(tail)
     return lines
 
+# ----------------- ВЫДЕЛЕНИЕ «ДОСТАВКИ» -----------------
+
+# Триггеры, по которым считаем строку «доставочной»
+_SHIP_RE = re.compile(
+    r"(?i)\b("
+    r"доставка|отправка|самовывоз|ship|shipping|pickup|courier|курьер|"
+    r"почта|почтой|cdek|сдэк|boxberry|боксберри|dpd|ems|dhl|fedex|ups|worldwide|по всему миру"
+    r")\b"
+)
+
+def _split_shipping(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """
+    Делит произвольные строки на:
+      - обычные (non_ship)
+      - доставочные (ship)
+    """
+    non_ship, ship = [], []
+    for ln in lines:
+        if _SHIP_RE.search(ln):
+            ship.append(ln)
+        else:
+            non_ship.append(ln)
+    return non_ship, ship
+
 # ----------------- ОСНОВНОЙ КОНСТРУКТОР -----------------
 
 def build_caption(user_caption: str) -> str:
@@ -105,7 +130,8 @@ def build_caption(user_caption: str) -> str:
     3) Состояние
     4) Цена
     5) Остальной текст (как есть, но очищенный)
-    6) Хвост: 'Общий альбом: ...' и 'Покупка/вопросы: ...'
+    6) Блок «доставка» (всегда ПЕРЕД хвостом)
+    7) Хвост: 'Общий альбом: ...' и 'Покупка/вопросы: ...'
     Без эмодзи, нормализованные тире/пробелы. Идемпотентно.
     """
     text = _clean_spaces(_strip_emojis(user_caption or ""))
@@ -115,35 +141,30 @@ def build_caption(user_caption: str) -> str:
         return "\n".join(_ensure_tail([])).strip()
 
     raw_lines = [ln.strip() for ln in text.split("\n")]
-    raw_lines = [ln for ln in raw_lines if not re.fullmatch(r"\s*", ln)]
+    raw_lines = [ln for ln in raw_lines if ln != ""]
 
     title: Optional[str] = None
     fields: Dict[str, str] = {}
     leftovers: List[str] = []
 
-    # Разбираем строки. Первую строку, которая не является нашим полем,
-    # считаем заголовком. Остальные «не поля» — как дополнительные описания.
+    # Разбор
     for ln in raw_lines:
         parsed = _parse_field_line(ln)
         if parsed:
             key, val = parsed
-            # Нормализуем «Цена»
-            if key == "Цена":
-                val = _norm_dash(val)
-                if not val.lower().startswith(("от ", "≈ ", "~ ", "≃ ")):
-                    # уберём возможный дублирующий «Цена — » вначале
-                    val = re.sub(r"^(цена|price)\s*[:\-—]?\s*", "", val, flags=re.I).strip()
             fields[key] = val
             continue
 
-        # Не поле:
         ln_clean = _norm_dash(ln)
         if title is None and ln_clean:
             title = ln_clean
         elif ln_clean:
             leftovers.append(ln_clean)
 
-    # Сборка в фиксированном порядке:
+    # Делим «доп. текст» на обычный и доставочный
+    non_ship, ship = _split_shipping(leftovers)
+
+    # Сборка в фиксированном порядке
     blocks: List[str] = []
     if title:
         blocks.append(title)
@@ -155,11 +176,18 @@ def build_caption(user_caption: str) -> str:
             else:
                 blocks.append(f"{key}: {fields[key]}")
 
-    # Остальной текст
-    if leftovers:
+    # Остальной (не доставочный) текст
+    if non_ship:
         if blocks and blocks[-1] != "":
             blocks.append("")
-        blocks.extend(leftovers)
+        blocks.extend(non_ship)
+
+    # Блок доставки — ВСЕГДА перед хвостом
+    if ship:
+        if blocks and blocks[-1] != "":
+            blocks.append("")
+        # можно схлопнуть в одну строку при желании; пока оставляем как есть
+        blocks.extend(ship)
 
     # Схлопнем лишние пустые
     blocks = _collapse_blank_lines(blocks)
