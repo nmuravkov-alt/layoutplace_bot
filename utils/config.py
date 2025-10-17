@@ -1,14 +1,20 @@
 import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# === Бот / Канал / Часовой пояс ===
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()   # @username или -100...
+TZ = os.getenv("TZ", "Europe/Moscow").strip()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@layoutplace")
-ADMINS = {int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x}
-TZ = os.getenv("TZ", "Europe/Moscow")
+# === Админы (числовые ID через запятую) ===
+ADMINS = [int(a.strip()) for a in os.getenv("ADMINS", "").split(",") if a.strip()]
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set (.env)")
-if not CHANNEL_ID:
-    raise RuntimeError("CHANNEL_ID is not set (.env)")
+# === Единый стиль: ссылка на общий альбом и контакт ===
+ALBUM_URL = os.getenv("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26").strip()
+CONTACT_TEXT = os.getenv("CONTACT_TEXT", "@layoutplacebuy").strip()
+
+# === База ===
+DB_PATH = os.getenv("DB_PATH", "/data/data.db").strip()
+
+# === Планировщик ===
+POST_TIMES = os.getenv("POST_TIMES", "12:00,16:00,20:00").split(",")
+PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
