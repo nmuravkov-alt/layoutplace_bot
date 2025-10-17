@@ -1,427 +1,301 @@
 # main.py
-import os, asyncio, logging, time, json, sqlite3
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional, Tuple
+import os
+import asyncio
+import logging
+from typing import Optional, Tuple, List
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
+from aiogram.types import Message, InputMediaPhoto, InputMediaVideo
 from aiogram.enums import ParseMode
-from aiogram.types import Message, InputMediaPhoto
 from aiogram.filters import Command
 
-# ─────────── Настройки из ENV ───────────
-def _env(name: str, default: str = "") -> str:
-    return os.getenv(name, default)
+# --- конфиг: берем из config.py (если есть) или из ENV ---
+try:
+    from config import (
+        TOKEN,
+        CHANNEL_ID,
+        ADMINS,
+        TZ,
+        POST_TIMES,
+        PREVIEW_MINUTES,
+    )
+except Exception:
+    TOKEN = os.getenv("BOT_TOKEN", "")
+    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1000000000000"))
+    # перечисли через запятую
+    ADMINS = [int(x) for x in os.getenv("ADMINS", "").replace(" ", "").split(",") if x]
+    TZ = os.getenv("TZ", "Europe/Moscow")
+    POST_TIMES = os.getenv("POST_TIMES", "12:00,16:00,20:00")
+    PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
 
-TOKEN = _env("BOT_TOKEN").strip()
-CHANNEL_ID = _env("CHANNEL_ID").strip()           # -100… или @username
-TZ = _env("TZ", "Europe/Moscow").strip()
+# --- БД ---
+from storage.db import (
+    init_db,
+    enqueue,
+    dequeue_oldest,
+    get_count,
+    list_queue,
+    wipe_queue,
+)
 
-ADMINS = [int(x) for x in _env("ADMINS", "").split(",") if x.strip()]
-POST_TIMES = [t.strip() for t in _env("POST_TIMES", "12:00,16:00,20:00").split(",") if t.strip()]
-PREVIEW_BEFORE_MIN = int(_env("PREVIEW_BEFORE_MIN", "45"))
-
-ALBUM_URL = _env("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26").strip()
-CONTACT_TEXT = _env("CONTACT_TEXT", "@layoutplacebuy").strip()
-
-DB_PATH = _env("DB_PATH", "/data/data.db").strip()
-os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-
-# ─────────── Логирование ───────────
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("layoutplace_bot")
 
-# ─────────── Бот/диспетчер ───────────
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(TOKEN)
 dp = Dispatcher()
 
-# ─────────── БД (встроено, без отдельных модулей) ───────────
-DESIRED_QUEUE_COLS = ["id", "items_json", "caption", "src_chat_id", "src_msg_id", "created_at"]
-def _connect():
-    cx = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cx.row_factory = sqlite3.Row
-    return cx
+# ========= УТИЛЫ ===========
 
-def _migrate():
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
-    # Проверим существующую схему queue
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='queue'")
-    if cur.fetchone() is None:
-        cur.execute("""
-            CREATE TABLE queue(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                items_json TEXT NOT NULL,
-                caption TEXT,
-                src_chat_id INTEGER,
-                src_msg_id INTEGER,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        cx.commit()
-        cx.close()
-        return
+def _is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
 
-    # есть таблица queue — проверим колонки
-    cur.execute("PRAGMA table_info(queue)")
-    cols = [r["name"] for r in cur.fetchall()]
-    if cols != DESIRED_QUEUE_COLS:
-        # создадим новую таблицу и аккуратно перенесём данные
-        cur.execute("""
-            ALTER TABLE queue RENAME TO queue_old_bak
-        """)
-        cur.execute("""
-            CREATE TABLE queue(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                items_json TEXT NOT NULL,
-                caption TEXT,
-                src_chat_id INTEGER,
-                src_msg_id INTEGER,
-                created_at INTEGER NOT NULL
-            )
-        """)
-        # попытаемся перенести, если возможно
-        try:
-            cur.execute("""
-                INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
-                SELECT
-                    COALESCE(items_json,
-                        CASE
-                            WHEN payload IS NOT NULL THEN payload
-                            ELSE '[]'
-                        END
-                    ) as items_json,
-                    caption,
-                    src_chat_id,
-                    src_msg_id,
-                    COALESCE(created_at, strftime('%s','now')) as created_at
-                FROM queue_old_bak
-            """)
-        except Exception as e:
-            log.warning(f"Миграция без переноса (ок): {e}")
-        cx.commit()
-        cur.execute("DROP TABLE IF EXISTS queue_old_bak")
-        cx.commit()
-    cx.close()
-
-def init_db():
-    _migrate()
-
-def enqueue(*, items: List[Dict], caption: str, src: Optional[Tuple[int,int]]):
-    cx = _connect()
-    cur = cx.cursor()
-    src_chat_id = src[0] if src else None
-    src_msg_id = src[1] if src else None
-    cur.execute("""
-        INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
-        VALUES(?,?,?,?,?)
-    """, (json.dumps(items, ensure_ascii=False), caption, src_chat_id, src_msg_id, int(time.time())))
-    cx.commit()
-    qid = cur.lastrowid
-    cx.close()
-    return qid
-
-def dequeue_oldest():
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT * FROM queue ORDER BY id LIMIT 1")
-    row = cur.fetchone()
-    if not row:
-        cx.close()
-        return None
-    cur.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
-    cx.commit()
-    cx.close()
-    items = json.loads(row["items_json"]) if row["items_json"] else []
-    src = (row["src_chat_id"], row["src_msg_id"]) if row["src_chat_id"] and row["src_msg_id"] else None
-    return {"items": items, "caption": row["caption"] or "", "src": src}
-
-def peek_oldest():
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT * FROM queue ORDER BY id LIMIT 1")
-    row = cur.fetchone()
-    cx.close()
-    if not row:
-        return None
-    items = json.loads(row["items_json"]) if row["items_json"] else []
-    src = (row["src_chat_id"], row["src_msg_id"]) if row["src_chat_id"] and row["src_msg_id"] else None
-    return {"items": items, "caption": row["caption"] or "", "src": src}
-
-def get_count():
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM queue")
-    c = cur.fetchone()["c"]
-    cx.close()
-    return c
-
-def meta_get(k: str) -> Optional[str]:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT v FROM meta WHERE k = ?", (k,))
-    row = cur.fetchone()
-    cx.close()
-    return row["v"] if row else None
-
-def meta_set(k: str, v: str):
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
-    cx.commit()
-    cx.close()
-
-# ─────────── Нормализация текста (единый стиль) ───────────
-def normalize_caption(text: str) -> str:
+def normalize_caption(text: Optional[str]) -> str:
     """
-    Приводим к единому стилю без эмодзи.
-    В конец добавляем:
-      Общий альбом: <ALBUM_URL>
-      Покупка/вопросы: <CONTACT_TEXT>
+    Приводим описание к единому стилю без эмодзи и добавляем хвост.
+    Ничего лишнего не трогаем, просто чистим и доклеиваем.
     """
-    def strip_emojis(s: str) -> str:
-        return "".join(ch for ch in s if ch.isascii() or (31 < ord(ch) < 127) or ch.isalnum() or ch.isspace() or ch in ".,:;!?/()-+@&_\"'—–%₽€$")
+    if not text:
+        text = ""
+    text = text.strip()
 
-    t = (text or "").replace("\r", "").strip()
-    t = strip_emojis(t)
-
-    # Убедимся, что цена выделена (просто нормализация дефиса)
-    t = t.replace(" - ", " — ")
-    # Убираем двойные пустые строки
-    lines = [ln.strip() for ln in t.split("\n")]
-    compact = []
-    for ln in lines:
-        if ln:
-            compact.append(ln)
-        elif compact and compact[-1] != "":
-            compact.append("")
-    t = "\n".join(compact).strip()
-
+    # Хвост без эмодзи, как договаривались
     tail = (
-        f"\n\nОбщий альбом: {ALBUM_URL}\n"
-        f"Покупка/вопросы: {CONTACT_TEXT}"
+        "\n\n"
+        "Доставка по всему миру\n"
+        "Общий альбом: https://vk.com/market-222108341?screen=group&section=album_26\n"
+        "Покупка/вопросы: @layoutplacebuy"
     )
-    # Не дублировать хвост, если уже вставлен
-    if ALBUM_URL in t or CONTACT_TEXT in t:
-        return t
-    return f"{t}{tail}"
 
-# ─────────── Альбом-кэш (media_group) ───────────
-ALBUM_CACHE: dict[tuple[int, str], list[str]] = {}
-ALBUM_LAST_SEEN: dict[tuple[int, str], float] = {}
-ALBUM_TTL_SEC = 15 * 60
+    # Если хвоста нет — добавим
+    if "vk.com/market-222108341" not in text and "@layoutplacebuy" not in text:
+        text = f"{text}{tail}"
+    return text
 
-async def _album_gc_loop():
-    while True:
-        now = time.time()
-        for key in list(ALBUM_LAST_SEEN.keys()):
-            if now - ALBUM_LAST_SEEN[key] > ALBUM_TTL_SEC:
-                ALBUM_LAST_SEEN.pop(key, None)
-                ALBUM_CACHE.pop(key, None)
-        await asyncio.sleep(30)
-
-@dp.message(F.media_group_id & (F.photo | F.document))
-async def on_album_piece(m: Message):
-    key = (m.chat.id, m.media_group_id)
-    ALBUM_CACHE.setdefault(key, [])
-    if m.photo:
-        fid = m.photo[-1].file_id
-        if fid not in ALBUM_CACHE[key]:
-            ALBUM_CACHE[key].append(fid)
-    elif m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
-        fid = m.document.file_id
-        if fid not in ALBUM_CACHE[key]:
-            ALBUM_CACHE[key].append(fid)
-    ALBUM_LAST_SEEN[key] = time.time()
-
-# ─────────── Helpers ───────────
-def tznow() -> datetime:
-    return datetime.now(ZoneInfo(TZ))
-
-def _today_slots() -> List[datetime]:
-    base = tznow().date()
-    out = []
-    for t in POST_TIMES:
-        hh, mm = [int(x) for x in t.split(":")]
-        out.append(datetime(base.year, base.month, base.day, hh, mm, tzinfo=ZoneInfo(TZ)))
-    return out
-
-async def _notify_admins(text: str):
-    for uid in ADMINS:
-        try:
-            await bot.send_message(uid, text, disable_web_page_preview=True)
-        except Exception as e:
-            log.warning(f"Админ {uid} недоступен: {e}")
-
-async def _send_to_channel(items: List[Dict], caption: str) -> int:
-    if len(items) > 1:
-        media = []
-        for i, it in enumerate(items):
-            cap = caption if i == 0 else ""
-            media.append(InputMediaPhoto(media=it["file_id"], caption=cap))
-        msgs = await bot.send_media_group(CHANNEL_ID, media)
-        return msgs[0].message_id
-    else:
-        it = items[0]
-        msg = await bot.send_photo(CHANNEL_ID, it["file_id"], caption=caption)
-        return msg.message_id
-
-def _items_from_message_or_album(msg: Message) -> List[Dict]:
-    m = msg.reply_to_message or msg
-    if m.media_group_id:
-        key = (msg.chat.id, m.media_group_id)
-        fids = ALBUM_CACHE.get(key, [])
-        if fids:
-            return [{"type": "photo", "file_id": fid} for fid in fids]
-    if m.photo:
-        return [{"type": "photo", "file_id": m.photo[-1].file_id}]
-    if m.document and m.document.mime_type and m.document.mime_type.startswith("image/"):
-        return [{"type": "photo", "file_id": m.document.file_id}]
-    return []
-
-def _src_tuple(msg: Message) -> Optional[Tuple[int,int]]:
+def _src_tuple(msg: Message) -> Optional[Tuple[int, int]]:
+    """
+    ВАЖНО: фикc под Aiogram v3.
+    Раньше m.forward_from_chat.type был enum, теперь это строка.
+    Возвращаем (chat_id, message_id) исходного поста (канал или пересланный из канала).
+    Работает ТОЛЬКО если команда даётся в ответ на сообщение (reply).
+    """
     m = msg.reply_to_message
     if not m:
         return None
-    if m.forward_from_chat and (m.forward_from_chat.type.value == "channel"):
+
+    # Переслано из канала
+    if m.forward_from_chat and getattr(m.forward_from_chat, "type", "") == "channel":
         return (m.forward_from_chat.id, m.forward_from_message_id)
-    if m.chat and m.chat.type.value == "channel":
+
+    # Сообщение из канала (если команда выполняется прямо в канале)
+    if m.chat and getattr(m.chat, "type", "") == "channel":
         return (m.chat.id, m.message_id)
+
     return None
 
-# ─────────── Команды ───────────
+async def _send_help(m: Message):
+    help_text = (
+        "Привет! Я помогу с очередью постов для канала.\n\n"
+        "Команды (нужно писать в ЛС боту или в админском чате, где бот есть):\n"
+        "/start — показать это сообщение\n"
+        "/queue — показать размер очереди\n"
+        "/list — показать первые 10 элементов очереди\n"
+        "/wipe — очистить очередь (только админы)\n\n"
+        "Добавление в очередь (два способа):\n"
+        "1) Ответ на пересланное из канала сообщение: напиши /add_post в ответ на пересланный пост (фото/альбом/видео/текст). Бот добавит исходник в очередь и потом опубликует с копированием медиа.\n"
+        "2) Ручной текст: отправь боту описание поста и затем команду /enqueue в ответ — он положит текст в очередь как текстовый пост.\n\n"
+        "Постинг по расписанию: 12:00, 16:00, 20:00 по Europe/Moscow. За 45 минут до поста бот шлёт превью в ЛС админам. "
+        "Чтобы бот мог писать тебе в ЛС, сначала нажми /start боту в личку.\n\n"
+        "Важно: при репосте из канала бот пытается удалить старое сообщение в источнике. Для этого у бота должны быть права администратора в исходном канале с разрешением на удаление сообщений."
+    )
+    # ВАЖНО: никаких угловых скобок — иначе Telegram подумает, что это HTML-тег
+    await m.answer(help_text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+# ========= ХЕНДЛЕРЫ ===========
+
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    text = (
-        "Бот готов.\n\n"
-        "/myid — твой ID\n"
-        "/add_post — ответом на пересланный пост (фото/альбом)\n"
-        "/queue — размер очереди\n"
-        "/post_oldest — опубликовать старый пост вручную\n"
-        "/clear_queue — очистить очередь\n"
-        "/test_preview — отправить тест-превью админам\n"
-        "/now — текущее время"
-    )
-    await m.answer(text, disable_web_page_preview=True)
+    await _send_help(m)
 
-@dp.message(Command("myid"))
-async def cmd_myid(m: Message):
-    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await _send_help(m)
 
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
-    await m.answer(f"В очереди: {get_count()}.")
+    if not _is_admin(m.from_user.id):
+        return
+    try:
+        count = get_count()
+        await m.answer(f"В очереди: {count}.")
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
 
-@dp.message(Command("clear_queue"))
-async def cmd_clear(m: Message):
-    removed = 0
-    while dequeue_oldest():
-        removed += 1
-    await m.answer(f"Очищено: {removed}.")
+@dp.message(Command("list"))
+async def cmd_list(m: Message):
+    if not _is_admin(m.from_user.id):
+        return
+    try:
+        items = list_queue(limit=10)
+        if not items:
+            await m.answer("Очередь пустая.")
+            return
+        lines = []
+        for it in items:
+            # Пытаемся красиво показать кратко
+            qid = it.get("id", "?")
+            src = it.get("src")
+            cap = (it.get("caption") or "").strip()
+            cap_short = (cap[:70] + "…") if len(cap) > 70 else cap
+            if src and isinstance(src, (list, tuple)) and len(src) == 2:
+                src_text = f"{src[0]}/{src[1]}"
+            else:
+                src_text = "—"
+            lines.append(f"#{qid} | src: {src_text} | {cap_short}")
+        await m.answer("Первые 10:\n" + "\n".join(lines))
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
+
+@dp.message(Command("wipe"))
+async def cmd_wipe(m: Message):
+    if not _is_admin(m.from_user.id):
+        return
+    try:
+        wipe_queue()
+        await m.answer("Очередь очищена.")
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
+
+@dp.message(Command("enqueue"))
+async def cmd_enqueue(m: Message):
+    """
+    Ручная постановка текста в очередь.
+    Делается ответом на СВОЁ текстовое сообщение (без медиа).
+    """
+    if not _is_admin(m.from_user.id):
+        return
+    if not m.reply_to_message or not (m.reply_to_message.text or m.reply_to_message.caption):
+        await m.answer("Использование: пришли текст поста, а потом в ответ на него команду /enqueue.")
+        return
+
+    raw_text = m.reply_to_message.text or m.reply_to_message.caption or ""
+    caption = normalize_caption(raw_text)
+    try:
+        # кладём как текстовый пост (без src), items = []
+        qid = enqueue(items=[], caption=caption, src=None)
+        await m.answer(f"Добавил текстовый пост в очередь, id={qid}.")
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
 
 @dp.message(Command("add_post"))
 async def cmd_add_post(m: Message):
-    if not (m.reply_to_message or m.photo or m.document):
-        await m.answer("Сделай /add_post ответом на пересланное из канала сообщение (фото/альбом).")
+    """
+    Главная команда: ставим в очередь исходный пост из канала.
+    Делаем это в ответ на пересланное сообщение из канала (или на сообщение из самого канала).
+    """
+    if not _is_admin(m.from_user.id):
         return
-    items = _items_from_message_or_album(m)
-    if not items:
-        await m.answer("Не нашёл фото. Пришли пересланный пост с фото/альбомом.")
+
+    src = _src_tuple(m)
+    if not src:
+        await m.answer(
+            "Сделай /add_post ответом на сообщение из канала (или пересланное из канала). "
+            "Так я смогу скопировать медиа и удалить старый пост после перепубликации."
+        )
         return
-    src_msg = m.reply_to_message or m
-    raw_caption = (src_msg.caption or "").strip()
+
+    # Попробуем взять подпись из реплая (если есть) и нормализовать
+    base = m.reply_to_message
+    raw_caption = (base.caption or base.text or "").strip()
     caption = normalize_caption(raw_caption)
-    qid = enqueue(items=items, caption=caption, src=_src_tuple(m))
-    await m.answer(f"Добавлено в очередь (id={qid}). В очереди: {get_count()}.")
+
+    try:
+        qid = enqueue(items=None, caption=caption, src=src)  # src-режим
+        await m.answer(f"Добавил в очередь исходный пост {src[0]}/{src[1]}, id={qid}.")
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
 
 @dp.message(Command("post_oldest"))
 async def cmd_post_oldest(m: Message):
-    task = dequeue_oldest()
-    if not task:
-        await m.answer("Очередь пуста.")
+    """
+    Ручной постинг самого старого элемента (для теста).
+    Реальный постинг по времени делает планировщик (scheduler), этот хендлер просто вызывает ту же логику через БД.
+    """
+    if not _is_admin(m.from_user.id):
         return
-    await _send_to_channel(task["items"], task["caption"])
-    if task["src"]:
-        try:
-            await bot.delete_message(task["src"][0], task["src"][1])
-        except Exception as e:
-            log.warning(f"Не смог удалить старое сообщение {task['src'][0]}/{task['src'][1]}: {e}")
-    await m.answer(f"Опубликовано. Осталось: {get_count()}.")
+    try:
+        task = dequeue_oldest()
+        if not task:
+            await m.answer("Очередь пустая.")
+            return
 
-@dp.message(Command("test_preview"))
-async def cmd_test_preview(m: Message):
-    await _notify_admins("Тестовое превью — пост будет за 45 минут до слота.\n(Если ты это видишь, то всё ок)")
-    await m.answer("Ок, превью отправлено админам (если они нажали /start боту).")
+        # task должен содержать либо src (перепост из канала), либо items/caption (собранный медиа-пост)
+        caption = normalize_caption(task.get("caption"))
 
-@dp.message(Command("now"))
-async def cmd_now(m: Message):
-    await m.answer(str(tznow()))
+        if task.get("src"):
+            src_chat_id, src_msg_id = task["src"]
+            # копируем исходное сообщение в наш канал (без ссылки на автора)
+            res = await bot.copy_message(
+                chat_id=CHANNEL_ID,
+                from_chat_id=src_chat_id,
+                message_id=src_msg_id,
+                caption=caption or None,
+                parse_mode=ParseMode.HTML,
+                disable_notification=False
+            )
+            # Пытаемся удалить старое сообщение (нужно право админа в исходном канале)
+            try:
+                await bot.delete_message(chat_id=src_chat_id, message_id=src_msg_id)
+            except Exception as del_err:
+                logging.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {del_err}")
+            await m.answer(f"Опубликовано в канал, новое id={res.message_id}.")
+            return
 
-# ─────────── Планировщик ───────────
-async def _catch_up_if_needed():
-    now = tznow()
-    last_key = "last_slot_ts"
-    last_ts = int(meta_get(last_key) or "0")
-    last_dt = datetime.fromtimestamp(last_ts, tz=ZoneInfo(TZ)) if last_ts else None
-    for slot in _today_slots():
-        if slot <= now and (not last_dt or slot > last_dt):
-            task = dequeue_oldest()
-            if not task:
-                break
-            await _send_to_channel(task["items"], task["caption"])
-            if task["src"]:
-                try:
-                    await bot.delete_message(task["src"][0], task["src"][1])
-                except Exception as e:
-                    log.warning(f"Catch-up delete failed: {e}")
-            meta_set(last_key, str(int(slot.timestamp())))
-            log.info(f"Catch-up: опубликован {slot.isoformat()}")
+        # вариант: в БД лежит собранный список медиа (items)
+        items: List[dict] = task.get("items") or []
+        if items:
+            # Если альбом
+            if len(items) > 1:
+                media = []
+                for i, it in enumerate(items):
+                    t = it.get("type")
+                    file_id = it.get("file_id")
+                    if not file_id:
+                        continue
+                    if t == "photo":
+                        media.append(InputMediaPhoto(media=file_id, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML))
+                    elif t == "video":
+                        media.append(InputMediaVideo(media=file_id, caption=caption if i == 0 else None, parse_mode=ParseMode.HTML))
+                if media:
+                    await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+                    await m.answer("Опубликован альбом.")
+                    return
+            else:
+                # одиночное медиа
+                it = items[0]
+                t = it.get("type")
+                fid = it.get("file_id")
+                if t == "photo":
+                    await bot.send_photo(chat_id=CHANNEL_ID, photo=fid, caption=caption, parse_mode=ParseMode.HTML)
+                elif t == "video":
+                    await bot.send_video(chat_id=CHANNEL_ID, video=fid, caption=caption, parse_mode=ParseMode.HTML)
+                else:
+                    await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+                await m.answer("Опубликовано.")
+                return
 
-async def run_scheduler():
-    log.info(f"Scheduler TZ={TZ}, times={','.join(POST_TIMES)}, preview_before={PREVIEW_BEFORE_MIN} min")
-    await _catch_up_if_needed()
-    last_key = "last_slot_ts"
-    preview_key = "preview_for_ts"
-    while True:
-        now = tznow()
-        # превью
-        for slot in _today_slots():
-            preview_at = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
-            if preview_at <= now < slot:
-                if meta_get(preview_key) != str(int(slot.timestamp())):
-                    peek = peek_oldest()
-                    if peek:
-                        eta = max(0, (slot - now).seconds // 60)
-                        await _notify_admins(f"Превью: следующий пост через {eta} мин.\n\n{peek['caption'][:800]}")
-                    meta_set(preview_key, str(int(slot.timestamp())))
-        # публикация
-        for slot in _today_slots():
-            last_ts = int(meta_get(last_key) or "0")
-            last_dt = datetime.fromtimestamp(last_ts, tz=ZoneInfo(TZ)) if last_ts else None
-            if slot <= now and (not last_dt or slot > last_dt):
-                task = dequeue_oldest()
-                if task:
-                    await _send_to_channel(task["items"], task["caption"])
-                    if task["src"]:
-                        try:
-                            await bot.delete_message(task["src"][0], task["src"][1])
-                        except Exception as e:
-                            log.warning(f"Delete source failed: {e}")
-                meta_set(last_key, str(int(slot.timestamp())))
-                log.info(f"Posted for slot {slot.isoformat()}")
-        await asyncio.sleep(20)
+        # fallback — просто текст
+        await bot.send_message(chat_id=CHANNEL_ID, text=caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        await m.answer("Опубликовано (текст).")
 
-# ─────────── Точка входа ───────────
+    except Exception as e:
+        await m.answer(f"Ошибка: {e}")
+
+# ========= ЗАПУСК =========
+
 async def _run():
-    if not TOKEN:
-        raise SystemExit("BOT_TOKEN is empty. Set it in Railway Variables.")
     init_db()
-    asyncio.create_task(_album_gc_loop())
-    asyncio.create_task(run_scheduler())
+    log.info("Starting bot instance...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    log.info("Starting bot instance...")
     asyncio.run(_run())
