@@ -412,7 +412,7 @@ async def on_text(m: Message):
 
 # -------------------- Запуск --------------------
 
-aasync def run_bot():
+async def run_bot():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     db_init()
     logger.info("🚀 Стартуем Layoutplace Bot...")
