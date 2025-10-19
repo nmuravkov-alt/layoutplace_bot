@@ -1,76 +1,60 @@
 import re
+from typing import Optional
 
-DASH = " — "
 
-def _clean_lines(text: str) -> list[str]:
-    text = (text or "").replace("\r", "")
-    lines = [l.strip() for l in text.split("\n")]
-    # выбрасываем пустые края
-    return [l for l in lines if l]
+def normalize_text(raw: Optional[str]) -> str:
+    """
+    Приводим входной текст к единому виду:
+    - вытягиваем название, размер, состояние, цену (если есть)
+    - чистим лишние пробелы, двойные переносы
+    NOTE: бот не «угадывает» поля, берёт как есть и аккуратно раскладывает.
+    """
+    raw = (raw or "").strip()
+    # Меняем длинные тире, пробелы
+    txt = raw.replace("—", "-").replace("–", "-")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
 
-def _rm_fixed(lines: list[str]) -> list[str]:
-    cleaned = []
-    for l in lines:
-        low = l.lower()
-        if "vk.com" in low:          # любые ссылки на vk/альбом
-            continue
-        if "общий альбом" in low:
-            continue
-        if "покупка/вопросы" in low:
-            continue
-        cleaned.append(l)
-    return cleaned
+    # Пытаемся найти цену вида "Цена - 4 250 ₽" или "Цена: 4250"
+    price_line = None
+    for line in txt.splitlines():
+        if re.search(r"(цена|price)", line, re.IGNORECASE):
+            price_line = line.strip()
+            break
 
-def _norm_pair(line: str, key: str, label: str) -> str|None:
-    # ключи: состояние/размер/цена
-    if re.search(fr"^{key}\s*[:\-–—]", line, flags=re.I):
-        val = re.sub(fr"^{key}\s*[:\-–—]\s*", "", line, flags=re.I).strip()
-        if not val: return None
-        if label == "Цена":
-            # чистим ₽ и пробелы/дефисы
-            val = re.sub(r"\s*р(уб|\.?)?\s*\.?$", " ₽", val, flags=re.I)
-            val = val.replace("руб", "₽").replace("р.", "₽").replace("р ", "₽ ")
-        return f"{label}{DASH if label=='Цена' else ' : '}{val}"
-    return None
+    # Выделяем хештеги (оставим в конце блока, если есть)
+    hashtags = [h for h in re.findall(r"(#[\w\d_]+)", txt, flags=re.UNICODE)]
+    hashtags_line = " ".join(sorted(set(hashtags), key=str.lower))
 
-def normalize_caption(original: str, album_url: str, contact_text: str) -> str:
-    lines = _clean_lines(original)
-    lines = _rm_fixed(lines)
+    # Убираем хештеги из основного текста (чтобы не дублировались)
+    if hashtags:
+        txt = re.sub(r"(#[\w\d_]+)", "", txt).strip()
+        txt = re.sub(r"[ \t]+", " ", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt)
 
-    title = None
-    head = []
-    tail = []
+    # Собираем
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    up_block = "\n".join(lines)
+    if price_line and price_line not in lines:
+        up_block += ("\n" + price_line)
 
-    # заголовок — первая строка, если она не ключ
-    if lines:
-        if not re.match(r"^(состояние|размер|цена)\b", lines[0], flags=re.I):
-            title = lines[0]; lines = lines[1:]
+    if hashtags_line:
+        up_block += ("\n\n" + hashtags_line)
 
-    # пройдемся и нормализуем известные поля
-    state = size = price = None
-    hashtags = []
-    for l in lines:
-        l2 = _norm_pair(l, "состояние", "Состояние")
-        if l2: state = l2; continue
-        l2 = _norm_pair(l, "размер", "Размер")
-        if l2: size = l2; continue
-        l2 = _norm_pair(l, "цена", "Цена")
-        if l2: price = l2; continue
-        if l.startswith("#"): hashtags.append(l)
-        else: tail.append(l)
+    return up_block.strip()
 
-    out = []
-    if title: out.append(title)
-    if state: out.append(state)
-    if size:  out.append(size)
-    if price: out.append(price)
-    # сначала хэштеги, затем «хвост»
-    out += hashtags + tail
 
-    # фикс-блок (не меняется)
+def build_final_caption(user_block: str, album_url: str, contact: str) -> str:
+    """
+    Итоговая подпись строго в едином стиле. Внизу неизменяемые ссылки.
+    """
+    user_block = (user_block or "").strip()
+    bottom = []
     if album_url:
-        out.append(f"Общий альбом: {album_url}")
-    if contact_text:
-        out.append(f"Покупка/вопросы: {contact_text}")
-
-    return "\n".join(out)
+        bottom.append(f"Общий альбом: {album_url}")
+    if contact:
+        bottom.append(f"Покупка/вопросы: {contact}")
+    tail = "\n".join(bottom)
+    if user_block and tail:
+        return f"{user_block}\n\n{tail}"
+    return user_block or tail or ""
