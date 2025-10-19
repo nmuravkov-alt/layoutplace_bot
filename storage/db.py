@@ -1,144 +1,110 @@
-# storage/db.py
 import os
-import sqlite3
-import time
 import json
-from typing import Optional, Tuple, List, Dict, Any
+import time
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
 
-_DB_PATH = None
+DB_PATH = os.getenv("DB_PATH", "/data/data.db")
+
+# ---------- low-level ----------
 
 def _connect() -> sqlite3.Connection:
-    assert _DB_PATH, "DB not initialized. Call init_db(db_path) first."
-    cx = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    cx = sqlite3.connect(DB_PATH)
     cx.row_factory = sqlite3.Row
     return cx
 
-def init_db(db_path: Optional[str] = None) -> None:
-    """Инициализация БД + мягкие миграции."""
-    global _DB_PATH
-    _DB_PATH = db_path or os.getenv("DB_PATH", "/data/layoutplace.db")
-    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+def init_db() -> None:
     cx = _connect()
-    try:
-        cur = cx.cursor()
-        # Базовая таблица очереди
-        cur.execute("""
+    with cx:
+        cx.execute("""
         CREATE TABLE IF NOT EXISTS queue (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            items_json    TEXT    NOT NULL,   -- список медиа-элементов (photo/file_id/тип)
-            caption       TEXT    NOT NULL,   -- текст финальной подписи
-            src_chat_id   INTEGER,            -- откуда было переслано (если было)
-            src_msg_id    INTEGER,            -- id исходного сообщения (если было)
-            status        TEXT    NOT NULL DEFAULT 'queued', -- queued|posted|error
-            scheduled_at  INTEGER,            -- Unix-время запланированной публикации (опц.)
-            created_at    INTEGER  NOT NULL,  -- Unix-время добавления в очередь
-            last_error    TEXT                -- последнее сообщение об ошибке (если было)
-        );
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT NOT NULL,       -- JSON: [{"type":"photo","file_id":"..."}, ...]
+            caption TEXT,                -- нормализованный текст
+            src_chat_id INTEGER,
+            src_msg_id INTEGER,
+            created_at INTEGER NOT NULL
+        )
         """)
-        # Простейшая миграция (на случай старых схем)
-        _safe_add_column(cur, "queue", "status",       "TEXT NOT NULL DEFAULT 'queued'")
-        _safe_add_column(cur, "queue", "scheduled_at", "INTEGER")
-        _safe_add_column(cur, "queue", "last_error",   "TEXT")
-        cx.commit()
-    finally:
-        cx.close()
+        cx.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """)
 
-def _safe_add_column(cur: sqlite3.Cursor, table: str, column: str, ddl: str) -> None:
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r["name"] for r in cur.fetchall()]
-    if column not in cols:
-        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+# ---------- meta helpers ----------
 
-# ---------------------------
-# CRUD для очереди
-# ---------------------------
-
-def enqueue(items: List[Dict[str, Any]],
-            caption: str,
-            src: Optional[Tuple[int, int]] = None,
-            scheduled_at: Optional[int] = None) -> int:
-    """
-    items: [{type:'photo'|'video'|'doc', file_id:'...', ...}, ...]
-    caption: финальный текст
-    src: (src_chat_id, src_msg_id) если переслано из канала
-    scheduled_at: Unix-время, когда постить (опционально)
-    """
+def meta_get(key: str) -> Optional[str]:
     cx = _connect()
-    try:
-        cur = cx.cursor()
-        src_chat_id, src_msg_id = (src or (None, None))
-        cur.execute("""
-            INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, scheduled_at, created_at)
-            VALUES(?,?,?,?,?,?)
-        """, (json.dumps(items, ensure_ascii=False), caption, src_chat_id, src_msg_id,
-              scheduled_at, int(time.time())))
-        cx.commit()
+    cur = cx.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cur.fetchone()
+    return row["value"] if row else None
+
+def meta_set(key: str, value: str) -> None:
+    cx = _connect()
+    with cx:
+        cx.execute("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                   (key, value))
+
+# last posted message id in channel (for deletion)
+def get_last_channel_msg_id() -> Optional[int]:
+    v = meta_get("last_channel_msg_id")
+    return int(v) if v and v.isdigit() else None
+
+def set_last_channel_msg_id(msg_id: int) -> None:
+    meta_set("last_channel_msg_id", str(msg_id))
+
+# ---------- queue API ----------
+
+def enqueue(items: List[Dict[str, Any]], caption: str, src: Tuple[Optional[int], Optional[int]]) -> int:
+    """Добавить в очередь. items — список dict: {"type": "photo"|"video"|"document", "file_id": "..."}"""
+    src_chat_id, src_msg_id = src
+    cx = _connect()
+    with cx:
+        cur = cx.execute("""
+            INSERT INTO queue(payload, caption, src_chat_id, src_msg_id, created_at)
+            VALUES(?,?,?,?,?)
+        """, (json.dumps(items, ensure_ascii=False), caption, src_chat_id, src_msg_id, int(time.time())))
         return cur.lastrowid
-    finally:
-        cx.close()
 
-def dequeue_oldest() -> Optional[sqlite3.Row]:
-    """Достаёт самую старую запись и помечает как posted только вызывающим кодом после успешной публикации."""
+def dequeue_oldest() -> Optional[Dict[str, Any]]:
+    """Достать и удалить самый старый элемент."""
     cx = _connect()
-    try:
-        cur = cx.cursor()
-        cur.execute("""
-            SELECT * FROM queue
-            WHERE status='queued'
-            ORDER BY id
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        return row
-    finally:
-        cx.close()
+    cur = cx.execute("SELECT * FROM queue ORDER BY id LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return None
+    with cx:
+        cx.execute("DELETE FROM queue WHERE id = ?", (row["id"],))
+    return dict(row)
 
-def mark_posted(qid: int) -> None:
+def peek_all() -> List[Dict[str, Any]]:
     cx = _connect()
-    try:
-        cx.execute("UPDATE queue SET status='posted' WHERE id=?", (qid,))
-        cx.commit()
-    finally:
-        cx.close()
+    cur = cx.execute("SELECT * FROM queue ORDER BY id")
+    return [dict(r) for r in cur.fetchall()]
 
-def mark_error(qid: int, error_text: str) -> None:
+def stats() -> Dict[str, int]:
     cx = _connect()
-    try:
-        cx.execute("UPDATE queue SET status='error', last_error=? WHERE id=?", (error_text, qid))
-        cx.commit()
-    finally:
-        cx.close()
+    cur = cx.execute("SELECT COUNT(*) AS c FROM queue")
+    queued = cur.fetchone()["c"]
+    return {"queued": queued}
 
-def remove(qid: int) -> None:
+def delete_by_id(qid: int) -> int:
     cx = _connect()
-    try:
-        cx.execute("DELETE FROM queue WHERE id=?", (qid,))
-        cx.commit()
-    finally:
-        cx.close()
+    with cx:
+        cur = cx.execute("DELETE FROM queue WHERE id = ?", (qid,))
+        return cur.rowcount
 
-def get_count(status: Optional[str] = None) -> int:
+def last_id() -> Optional[int]:
     cx = _connect()
-    try:
-        cur = cx.cursor()
-        if status:
-            cur.execute("SELECT COUNT(*) AS c FROM queue WHERE status=?", (status,))
-        else:
-            cur.execute("SELECT COUNT(*) AS c FROM queue")
-        return int(cur.fetchone()["c"])
-    finally:
-        cx.close()
+    cur = cx.execute("SELECT id FROM queue ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    return row["id"] if row else None
 
-def list_queue(limit: int = 20) -> List[sqlite3.Row]:
+def clear_queue() -> int:
     cx = _connect()
-    try:
-        cur = cx.cursor()
-        cur.execute("""
-            SELECT id, caption, status, created_at, scheduled_at
-            FROM queue
-            ORDER BY id
-            LIMIT ?
-        """, (limit,))
-        return cur.fetchall()
-    finally:
-        cx.close()
+    with cx:
+        cur = cx.execute("DELETE FROM queue")
+        return cur.rowcount
