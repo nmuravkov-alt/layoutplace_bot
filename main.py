@@ -1,350 +1,300 @@
-# main.py
 import asyncio
+import logging
 import os
-import re
-from typing import Optional, Tuple, List, Dict
+from datetime import datetime, timedelta
 
+import pytz
 from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ParseMode, ChatType
-from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    InputMediaPhoto,
-)
+from aiogram.filters import Command, CommandObject
+from aiogram.enums import ParseMode
+from aiogram.types import Message, InputMediaPhoto
+from aiogram.utils.media_group import MediaGroupBuilder
 
-# =========================
-# ENV & базовая инициализация
-# =========================
+from storage.db import init_db, enqueue, dequeue_oldest, get_count, peek_oldest, get_all
+from utils import normalize_text, build_final_caption
+
+# ----------------- CONFIG -----------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("layoutplace_bot")
+
 TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("ENV TOKEN пуст или имеет неверный формат. Задайте корректный токен бота.")
 
-def _parse_admins(env_val: str) -> List[int]:
-    if not env_val:
-        return []
-    out = []
-    for part in env_val.split(","):
+# Комма-разделённый список ID админов
+ADMINS = []
+_adm = os.getenv("ADMINS", "").strip()
+if _adm:
+    for part in _adm.replace(";", ",").split(","):
         p = part.strip()
-        if not p:
-            continue
-        try:
-            out.append(int(p))
-        except ValueError:
-            pass
-    return out
+        if p.isdigit():
+            ADMINS.append(int(p))
+# На всякий случай подхватим дефолт из переписки
+for default_id in (469734432, 6773668793):
+    if default_id not in ADMINS:
+        ADMINS.append(default_id)
 
-ADMINS: List[int] = _parse_admins(os.getenv("ADMINS", ""))
-try:
-    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1000000000000"))
-except ValueError:
-    CHANNEL_ID = -1000000000000  # заглушка, чтобы не падать
+# Куда постим
+# Можно указать @username канала, но для удаления старого нужен numeric id формата -100...
+_channel_env = os.getenv("CHANNEL_ID", "").strip()
+if _channel_env.startswith("@"):
+    CHANNEL_ID = _channel_env  # постить можно и так
+else:
+    try:
+        CHANNEL_ID = int(_channel_env)
+    except Exception:
+        CHANNEL_ID = -1001758490510  # твой канал из переписки
 
 TZ = os.getenv("TZ", "Europe/Moscow")
+tz = pytz.timezone(TZ)
+
+# слоты автопоста
+POST_TIMES = [t.strip() for t in os.getenv("POST_TIMES", "12:00,16:00,20:00").split(",")]
+PREVIEW_BEFORE_MIN = int(os.getenv("PREVIEW_BEFORE_MIN", "45"))
+
+# неизменяемые ссылки
+ALBUM_URL = os.getenv("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26")
+CONTACT = os.getenv("CONTACT", "@layoutplacebuy")
 
 bot = Bot(TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-
-# =========================
-# Глобальные структуры
-# =========================
-# Очередь постов: [{"items":[{"type":"photo","file_id":"..."}], "caption":"...", "src": (chat_id, msg_id) or None}]
-QUEUE: List[Dict] = []
-
-# Буфер альбомов по пользователю (когда просто пересылают альбом — без реплая)
-ALBUM_BUFFER: Dict[int, Dict] = {}
-# Индекс по media_group_id → весь собранный альбом (чтобы /add_post в ответ на ЛЮБУЮ часть)
-MEDIA_GROUPS: Dict[str, Dict] = {}
-
-# Очистка старых записей в буферах (таймаут в секундах)
-ALBUM_TTL = 120  # 2 минуты
+# Буфер для альбомов (media_group)
+ALBUM_BUFFER = {}  # media_group_id -> list[photo_file_id]
+ALBUM_TTL_SEC = 90
 
 
-# =========================
-# Вспомогательные функции
-# =========================
-def build_caption(raw: str) -> str:
-    """
-    Приводим текст к единому виду:
-    - Оставляем исходные строки (чуть чистим пробелы)
-    - Обязательно добавляем две неизменные строки внизу (альбом и покупка)
-    Без эмодзи, как просили.
-    """
-    raw = (raw or "").strip()
-
-    # простейшие подчистки мусора и двойных пробелов
-    cleaned = re.sub(r"[ \t]+", " ", raw)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-    # неизменяемые ссылки (во всех постах)
-    album_line = "Общий альбом: https://vk.com/market-222108341?screen=group&section=album_26"
-    buy_line = "Покупка/вопросы: @layoutplacebuy"
-
-    # не дублируем, если уже есть
-    parts = [cleaned] if cleaned else []
-    if album_line not in cleaned:
-        parts.append(album_line)
-    if buy_line not in cleaned:
-        parts.append(buy_line)
-
-    final = "\n\n".join([p for p in parts if p]).strip()
-    return final or (album_line + "\n\n" + buy_line)
+# ----------------- HELP -----------------
+def help_text() -> str:
+    return (
+        "Команды:\n"
+        "/queue – показать очередь\n"
+        "/post_oldest – постить самый старый из очереди (без автодогонялки)\n"
+        "/test_preview – прислать превью ближайшего слота\n\n"
+        "Как добавить пост:\n"
+        "• Перешли боту пост (фото+подпись или просто фото/текст). Бот сам положит в очередь в едином стиле.\n"
+        "• Для альбомов (несколько фото) пересылай как альбом.\n"
+        "\nПубликация:\n"
+        "• Автослоты: 12:00 / 16:00 / 20:00 (TZ=" + TZ + ")\n"
+        f"• Превью за {PREVIEW_BEFORE_MIN} мин в ЛС админам.\n"
+        "• Старый оригинал после постинга удаляется (если можно).\n"
+    )
 
 
-def _is_admin(uid: int) -> bool:
-    return uid in ADMINS
+# ----------------- UTIL -----------------
+def _now():
+    return datetime.now(tz)
 
 
-def _src_tuple(msg: Message) -> Optional[Tuple[int, int]]:
-    """
-    Пытаемся вытащить исходник канального поста, чтобы потом удалить дубликат.
-    Работает, если автор НЕ скрыт (forward_from_chat доступен и type == 'channel').
-    """
+def _src_tuple(m: Message):
+    # если сообщение переслано из канала — сохраняем откуда
     try:
-        if msg.forward_from_chat and msg.forward_from_chat.type == ChatType.CHANNEL:
-            return (msg.forward_from_chat.id, msg.forward_from_message_id)
+        if m.forward_from_chat and (str(getattr(m.forward_from_chat, "type", "")) == "channel"):
+            return (m.forward_from_chat.id, m.forward_from_message_id)
     except Exception:
         pass
-    return None
+    # если нет — попробуем из reply_to (когда добавляют по ответу на канал)
+    if m.reply_to_message and (str(getattr(m.reply_to_message.chat, "type", "")) == "channel"):
+        return (m.reply_to_message.chat.id, m.reply_to_message.message_id)
+    return (None, None)
 
 
-def _extract_single_from_message(msg: Message) -> Tuple[List[Dict], str]:
-    """
-    Извлекаем одиночное фото (если есть) и подпись.
-    """
-    items: List[Dict] = []
-    caption = msg.caption or msg.text or ""
-
-    if msg.photo:
-        items.append({"type": "photo", "file_id": msg.photo[-1].file_id})
-
-    return items, caption
+async def _send_preview_to_admins(text: str):
+    for aid in ADMINS:
+        try:
+            await bot.send_message(aid, text, disable_web_page_preview=True)
+        except Exception as e:
+            log.warning(f"Админ {aid} недоступен: {e}")
 
 
-def _get_ready_album_from_buffer(user_id: int) -> Optional[Tuple[List[Dict], str]]:
-    """
-    Достаём готовый альбом из пользовательского буфера, если он «свежий».
-    """
-    buf = ALBUM_BUFFER.get(user_id)
-    if not buf:
-        return None
-    loop_ts = asyncio.get_running_loop().time()
-    if loop_ts - buf.get("ts", 0) > ALBUM_TTL:
-        ALBUM_BUFFER.pop(user_id, None)
-        return None
-    items = buf.get("items") or []
-    if not items:
-        return None
-    caption = buf.get("caption") or ""
-    return items, caption
-
-
-def _merge_album_piece(user_id: int, msg: Message):
-    """
-    Сливаем очередной кусок альбома в буфер по пользователю И в индекс по media_group_id.
-    Благодаря этому /add_post можно сделать реплаем на любую часть альбома.
-    """
-    mg_id = msg.media_group_id
-    if not mg_id:
+async def _send_preview_of_oldest():
+    peek = peek_oldest()
+    if not peek:
         return
+    items = peek["items"]
+    cap = peek["caption"] or ""
+    uni = build_final_caption(normalize_text(cap), ALBUM_URL, CONTACT)
 
-    # ---- буфер по пользователю ----
-    u_buf = ALBUM_BUFFER.get(user_id)
-    if not u_buf or u_buf.get("mg_id") != mg_id:
-        ALBUM_BUFFER[user_id] = {
-            "mg_id": mg_id,
-            "items": [],
-            "caption": msg.caption or "",
-            "ts": asyncio.get_running_loop().time(),
-        }
-        u_buf = ALBUM_BUFFER[user_id]
-
-    if msg.photo:
-        u_buf["items"].append({"type": "photo", "file_id": msg.photo[-1].file_id})
-    if msg.caption and not u_buf.get("caption"):
-        u_buf["caption"] = msg.caption
-    u_buf["ts"] = asyncio.get_running_loop().time()
-
-    # ---- индекс по media_group_id ----
-    g = MEDIA_GROUPS.get(mg_id)
-    if not g:
-        MEDIA_GROUPS[mg_id] = {
-            "items": [],
-            "caption": msg.caption or "",
-            "ts": asyncio.get_running_loop().time(),
-        }
-        g = MEDIA_GROUPS[mg_id]
-
-    if msg.photo:
-        g["items"].append({"type": "photo", "file_id": msg.photo[-1].file_id})
-    if msg.caption and not g.get("caption"):
-        g["caption"] = msg.caption
-    g["ts"] = asyncio.get_running_loop().time()
+    # отправляем КАК ПРЕВЬЮ в ЛС админам (только текст и первая картинка)
+    head = f"⚠️ Превью следующего поста (id={peek['id']})\n\n{uni}"
+    if items and any(i.get("type") == "photo" for i in items):
+        first_photo = next(i for i in items if i.get("type") == "photo")
+        for aid in ADMINS:
+            try:
+                await bot.send_photo(aid, first_photo["file_id"], caption=head)
+            except Exception as e:
+                log.warning(f"Не смог отправить превью фото админу {aid}: {e}")
+    else:
+        await _send_preview_to_admins(head)
 
 
-async def _post_to_channel(task: Dict) -> bool:
-    """
-    Постинг в канал. Возвращает True при успехе.
-    task = {"items":[...], "caption":"...", "src": (chat_id, msg_id) or None}
-    """
-    items = task.get("items") or []
-    caption = task.get("caption") or ""
+async def _post_task(task: dict) -> bool:
+    """Постит одну задачу в канал, пытается удалить источник."""
+    items = task["items"]
+    cap_raw = task["caption"] or ""
+    caption = build_final_caption(normalize_text(cap_raw), ALBUM_URL, CONTACT)
 
-    if not items and not caption:
+    try:
+        photos = [i for i in items if i.get("type") == "photo"]
+        if len(photos) > 1:
+            mg = MediaGroupBuilder()
+            for idx, p in enumerate(photos):
+                if idx == 0:
+                    mg.add_photo(media=p["file_id"], caption=caption)
+                else:
+                    mg.add_photo(media=p["file_id"])
+            await bot.send_media_group(CHANNEL_ID, media=mg.build())
+        elif len(photos) == 1:
+            await bot.send_photo(CHANNEL_ID, photo=photos[0]["file_id"], caption=caption)
+        else:
+            # только текст
+            await bot.send_message(CHANNEL_ID, caption, disable_web_page_preview=True)
+
+        # удалить источник
+        if task.get("src"):
+            src_chat_id, src_msg_id = task["src"]
+            if src_chat_id and src_msg_id:
+                try:
+                    await bot.delete_message(src_chat_id, src_msg_id)
+                except Exception as e:
+                    log.warning(f"Не смог удалить старое сообщение {src_chat_id}/{src_msg_id}: {e}")
+
+        return True
+    except Exception as e:
+        log.exception(f"Публикация не удалась: {e}")
         return False
 
-    # мультимедиа альбом
-    if len(items) > 1:
-        media: List[InputMediaPhoto] = []
-        for i, it in enumerate(items):
-            if it["type"] == "photo":
-                if i == 0:
-                    media.append(InputMediaPhoto(media=it["file_id"], caption=caption, parse_mode=ParseMode.HTML))
-                else:
-                    media.append(InputMediaPhoto(media=it["file_id"]))
-        await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
-        return True
 
-    # одиночка (фото с подписью или просто текст)
-    if items and items[0]["type"] == "photo":
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=items[0]["file_id"], caption=caption)
-        return True
-
-    # чисто текст
-    await bot.send_message(chat_id=CHANNEL_ID, text=caption, disable_web_page_preview=True)
-    return True
+def _next_slots_today():
+    base = _now().replace(second=0, microsecond=0)
+    out = []
+    for ts in POST_TIMES:
+        hh, mm = ts.split(":")
+        candidate = base.replace(hour=int(hh), minute=int(mm))
+        out.append(candidate)
+    return out
 
 
-async def _maybe_delete_original(src: Optional[Tuple[int, int]]):
+# ----------------- SCHED -----------------
+async def scheduler_loop():
     """
-    Если знаем исходный канал и msg_id — пробуем удалить оригинал.
-    Не всегда возможно (скрытый автор, чужой канал, нет прав).
+    Каждую минуту:
+    - если сейчас ровно слот — постим ОДИН самый старый (если есть)
+    - если сейчас за PREVIEW_BEFORE_MIN до слота — шлём превью
     """
-    if not src:
-        return
-    chat_id, msg_id = src
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-    except Exception as e:
-        # Молча проглатываем — удаление не критично для работы
-        print(f"Warn: can't delete original {chat_id}/{msg_id}: {e}")
+    posted_marks = set()
+    preview_marks = set()
+    while True:
+        now = _now().replace(second=0, microsecond=0)
+        # сброс маркеров в новый день
+        if len(posted_marks) > 10 or len(preview_marks) > 10:
+            posted_marks = {m for m in posted_marks if m.date() == now.date()}
+            preview_marks = {m for m in preview_marks if m.date() == now.date()}
+
+        for slot in _next_slots_today():
+            # превью
+            pv = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
+            if now == pv and pv not in preview_marks:
+                preview_marks.add(pv)
+                if get_count() > 0:
+                    await _send_preview_of_oldest()
+
+            # сам пост
+            if now == slot and slot not in posted_marks:
+                posted_marks.add(slot)
+                if get_count() > 0:
+                    task = dequeue_oldest()
+                    if task:
+                        await _post_task(task)
+
+        await asyncio.sleep(60)
 
 
-# =========================
-# Хендлеры
-# =========================
+# ----------------- HANDLERS -----------------
 @dp.message(Command("start"))
 async def cmd_start(m: Message):
-    help_text = (
-        "Привет! Я помогу публиковать объявления в канал.\n\n"
-        "<b>Основные команды:</b>\n"
-        "• <b>/add_post</b> — добавить в очередь:\n"
-        "    └ Реплай на часть альбома → возьму весь альбом целиком\n"
-        "    └ Или просто после пересылки альбома (без реплая) — из буфера\n"
-        "    └ Одиночное фото/текст тоже поддерживается\n"
-        "• <b>/queue</b> — показать размер очереди\n"
-        "• <b>/post_oldest</b> — запостить самый старый из очереди\n"
-        "• <b>/clear_queue</b> — очистить очередь (только админы)\n\n"
-        "Формат подписи приводится к единому виду и внизу <i>всегда</i> добавляются:\n"
-        "«Общий альбом» и «Покупка/вопросы»."
-    )
-    await m.answer(help_text, disable_web_page_preview=True)
-
-
-# Собираем части альбома в буферы (по пользователю и по media_group_id)
-@dp.message(F.media_group_id != None, F.content_type.in_({"photo"}))
-async def on_any_album_piece(m: Message):
-    _merge_album_piece(m.from_user.id, m)
-
-
-@dp.message(Command("add_post"))
-async def cmd_add_post(m: Message):
-    """
-    Добавляет пост в очередь.
-    Приоритет:
-      A) если это реплай на часть альбома -> берём весь альбом по media_group_id из MEDIA_GROUPS
-      B) иначе, если недавно пересылали альбом -> берём из ALBUM_BUFFER по user_id
-      C) иначе берём одиночное сообщение (реплай или текущее)
-    Сохраняем source (если возможно), чтобы потом удалить оригинал.
-    """
-    user_id = m.from_user.id
-
-    # --- A) Реплай на часть альбома? ---
-    src_msg = m.reply_to_message
-    if src_msg and src_msg.media_group_id:
-        mg_id = src_msg.media_group_id
-        g = MEDIA_GROUPS.get(mg_id)
-        # не старше ALBUM_TTL
-        if g and (asyncio.get_running_loop().time() - g.get("ts", 0) <= ALBUM_TTL) and g.get("items"):
-            items = list(g["items"])
-            caption = g.get("caption") or ""
-            final_caption = build_caption(caption)
-            src = _src_tuple(src_msg)  # попытка сохранить источник для удаления
-            QUEUE.append({"items": items, "caption": final_caption, "src": src})
-            await m.answer("✅ Альбом (по реплаю) добавлен в очередь.")
-            return
-        # если индекс не найден — попробуем fallback на пользовательский буфер ниже
-
-    # --- B) Пробуем взять готовый альбом из пользовательского буфера ---
-    ready = _get_ready_album_from_buffer(user_id)
-    if ready:
-        items, caption = ready
-        src = _src_tuple(m.reply_to_message or m)  # возможно, пересылали прямо сейчас
-    else:
-        # --- C) одиночное (реплай или текущее) ---
-        src_msg = m.reply_to_message or m
-        items, caption = _extract_single_from_message(src_msg)
-        src = _src_tuple(src_msg)
-
-    if not items and not caption:
-        await m.answer("❌ Не нашёл ни фото/альбома, ни текста. Перешли пост и снова /add_post.")
-        return
-
-    final_caption = build_caption(caption)
-    QUEUE.append({"items": items, "caption": final_caption, "src": src})
-    await m.answer("✅ Пост добавлен в очередь.")
+    await m.answer(help_text(), disable_web_page_preview=True)
 
 
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
-    await m.answer(f"В очереди: {len(QUEUE)}.")
-
-
-@dp.message(Command("clear_queue"))
-async def cmd_clear(m: Message):
-    if not _is_admin(m.from_user.id):
-        return
-    QUEUE.clear()
-    await m.answer("🧹 Очередь очищена.")
+    cnt = get_count()
+    lines = [f"В очереди: {cnt}"]
+    if cnt:
+        items = get_all(limit=min(cnt, 10))
+        for it in items:
+            lines.append(f"- id={it['id']} ({len([x for x in it['items'] if x.get('type')=='photo'])} фото)")
+    await m.answer("\n".join(lines))
 
 
 @dp.message(Command("post_oldest"))
 async def cmd_post_oldest(m: Message):
-    """
-    Публикует самый старый пост из очереди, затем пытается удалить исходник (если он известен).
-    """
-    if not QUEUE:
-        await m.answer("Очередь пуста.")
+    task = dequeue_oldest()
+    if not task:
+        await m.answer("Очередь пустая.")
+        return
+    ok = await _post_task(task)
+    await m.answer("Готово." if ok else "Ошибка публикации, смотри логи.")
+
+
+@dp.message(Command("test_preview"))
+async def cmd_test_preview(m: Message):
+    if get_count() == 0:
+        await m.answer("В очереди пусто, превью нечего показывать.")
+        return
+    await _send_preview_of_oldest()
+    await m.answer("Превью отправлено админам в ЛС.")
+
+
+# Добавление: фото/альбом/текст — автоматически в очередь
+@dp.message(F.media_group_id.as_("mgid") | F.photo | F.text)
+async def inbox(m: Message, mgid: int | None = None):
+    # только приватные чаты с админами
+    if m.chat.type != "private" or (m.from_user and m.from_user.id not in ADMINS):
         return
 
-    task = QUEUE.pop(0)
-    ok = await _post_to_channel(task)
-    if not ok:
-        await m.answer("Не удалось отправить пост.")
+    # 1) копим альбом по media_group_id
+    if mgid:
+        # накапливаем
+        photos = ALBUM_BUFFER.get(mgid, [])
+        # берём самый большой файл_id
+        if m.photo:
+            photos.append(m.photo[-1].file_id)
+        ALBUM_BUFFER[mgid] = photos
+        # ждём завершения группы — в aiogram 3 альбом приходит батчем,
+        # но надёжнее подождать небольшой таймаут перед сборкой.
+        await asyncio.sleep(1.0)
+        # проверим, все ли части уже пришли — эвристика: если следующее сообщение не из этой группы, соберём.
+        # Проще: если через 1 сек мы здесь — пытаемся собрать.
+        items = [{"type": "photo", "file_id": fid} for fid in ALBUM_BUFFER.get(mgid, [])]
+        if not items:
+            return
+        # подпись только из первого сообщения группы
+        caption = (m.caption or m.text or "").strip()
+        qid = enqueue(items=items, caption=caption, src=_src_tuple(m))
+        # очищаем буфер
+        ALBUM_BUFFER.pop(mgid, None)
+        await m.answer(f"Добавил в очередь (id={qid}). Фото: {len(items)}")
         return
 
-    # попытка удалить оригинал
-    await _maybe_delete_original(task.get("src"))
-    await m.answer("✅ Опубликовано.")
+    # 2) одиночное фото
+    if m.photo:
+        items = [{"type": "photo", "file_id": m.photo[-1].file_id}]
+        caption = (m.caption or "").strip()
+        qid = enqueue(items=items, caption=caption, src=_src_tuple(m))
+        await m.answer(f"Добавил одно фото в очередь (id={qid}).")
+        return
+
+    # 3) просто текст — тоже кладём (будет текстовый пост)
+    if (m.text or "").strip():
+        qid = enqueue(items=[], caption=m.text, src=_src_tuple(m))
+        await m.answer(f"Добавил текстовый пост в очередь (id={qid}).")
+        return
 
 
-# =========================
-# Точка входа
-# =========================
+# ----------------- RUN -----------------
 async def run_bot():
-    print("Starting bot instance...")
+    init_db()
+    # Параллельно стартуем планировщик
+    asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(run_bot())
