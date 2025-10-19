@@ -7,8 +7,10 @@ import sqlite3
 import asyncio
 import logging
 from typing import List, Optional, Dict, Tuple
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command            # <— важный импорт
 from aiogram.enums import ParseMode
 from aiogram.types import (
     Message,
@@ -47,10 +49,7 @@ DB_PATH = os.getenv("DB_PATH", "/data/data.db")
 # Логирование
 # =========================
 logger = logging.getLogger("layoutplace_bot")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
 # =========================
 # Бот и диспетчер
@@ -84,7 +83,6 @@ def init_db():
         v INTEGER NOT NULL
     );
     """)
-    # счётчики
     cur.execute("INSERT OR IGNORE INTO stats(k,v) VALUES('posted',0)")
     cur.execute("INSERT OR IGNORE INTO stats(k,v) VALUES('errors',0)")
     cx.commit()
@@ -147,25 +145,12 @@ FOOTER_TEMPLATE = (
 
 def build_final_caption(text: Optional[str]) -> str:
     text = (text or "").strip()
-
-    # Нормализуем дешёвые тире/множественные пробелы
-    text = text.replace(" —", " —").replace("–", "—")
+    text = text.replace(" –", " —").replace("–", "—")
     text = "\n".join([ln.rstrip() for ln in text.splitlines()])
 
-    # Хвост — добавляем только если его ещё нет
-    hashtags = ""
-    album_line = ""
-    contact_line = ""
-
-    if ALBUM_URL and (ALBUM_URL not in text):
-        album_line = f"\nОбщий альбом: {ALBUM_URL}"
-    if CONTACT and (CONTACT not in text):
-        contact_line = f"\nПокупка/вопросы: {CONTACT}"
-
-    # Подберём хэштеги из первых строк (если есть)
-    # Если хочешь фиксированный, можно задать здесь:
-    # hashtags = "\n#толстовки"   # пример
-    # Оставим пустым по умолчанию
+    hashtags = ""  # при желании можно задать фиксированный тег
+    album_line = f"\nОбщий альбом: {ALBUM_URL}" if ALBUM_URL and (ALBUM_URL not in text) else ""
+    contact_line = f"\nПокупка/вопросы: {CONTACT}" if CONTACT and (CONTACT not in text) else ""
     if hashtags and (hashtags.strip() not in text):
         hashtags = "\n" + hashtags.strip()
 
@@ -183,11 +168,7 @@ def _extract_media_item(m: Message) -> Optional[dict]:
     if m.photo:
         return {"kind": "photo", "file_id": m.photo[-1].file_id}
     if m.document:
-        return {
-            "kind": "doc",
-            "file_id": m.document.file_id,
-            "file_name": m.document.file_name or None
-        }
+        return {"kind": "doc", "file_id": m.document.file_id, "file_name": m.document.file_name or None}
     return None
 
 def _build_media_group(items: List[dict], caption: Optional[str]) -> List:
@@ -204,12 +185,10 @@ def _build_media_group(items: List[dict], caption: Optional[str]) -> List:
 # Публикация поста
 # =========================
 async def publish_one(post: Dict):
-    """post = {'id', 'items', 'caption', 'src'}"""
     items: List[dict] = post["items"] or []
     caption: str = post.get("caption") or ""
     src: Optional[Tuple[int,int]] = post.get("src")
 
-    # Удалим старый источник из канала, если это был форвард оттуда
     if src and src[0] == CHANNEL_ID:
         try:
             await bot.delete_message(chat_id=src[0], message_id=src[1])
@@ -227,16 +206,14 @@ async def publish_one(post: Dict):
             else:
                 await bot.send_document(chat_id=CHANNEL_ID, document=it["file_id"], caption=caption)
         else:
-            # Текстовый пост
             await bot.send_message(chat_id=CHANNEL_ID, text=caption)
-
         stat_inc("posted")
     except Exception as e:
         logger.exception(f"Ошибка публикации: {e}")
         stat_inc("errors")
 
 # =========================
-# Альбом-буфер (склейка по media_group_id)
+# Альбом-буфер
 # =========================
 class AlbumBuffer:
     def __init__(self, timeout: float = 1.5):
@@ -329,7 +306,6 @@ async def cmd_post_oldest(m: Message):
 # =========================
 @dp.message(F.from_user.id.in_(ADMINS) & (F.photo | F.document))
 async def handle_media(m: Message):
-    # источник, если это форвард из канала
     src: Optional[Tuple[int,int]] = None
     if m.forward_from_chat and getattr(m.forward_from_chat, "type", None) == "channel":
         src = (m.forward_from_chat.id, m.forward_from_message_id)
@@ -340,18 +316,16 @@ async def handle_media(m: Message):
 
     caption_raw = (m.caption or "").strip()
 
-    # Альбом
-    if m.media_group_id:
+    if m.media_group_id:  # альбом
         mgid = str(m.media_group_id)
         album_buffer.add(mgid, item, caption_raw or None, src)
-        # по таймеру склеим и поставим в очередь
         album_buffer.start_timer(
             mgid,
             lambda items, cap, s: _finalize_album_and_enqueue(items, cap, s, reply_to=m)
         )
         return
 
-    # Одиночное медиа
+    # одиночное медиа
     norm_caption = build_final_caption(caption_raw)
     qid = enqueue(items=[item], caption=norm_caption, src=src)
     await m.answer(f"✅ Пост #{qid} добавлен в очередь и будет опубликован автоматически.")
@@ -368,23 +342,6 @@ async def handle_text(m: Message):
 # =========================
 # Планировщик
 # =========================
-def _now_in_tz():
-    return pytz.timezone(TZ).fromutc(pytz.utc.localize(datetime.utcnow())).replace(tzinfo=None)
-
-from datetime import datetime, timedelta
-
-def _today_times_local() -> List[datetime]:
-    today = datetime.now(pytz.timezone(TZ)).date()
-    out = []
-    for t in POST_TIMES:
-        try:
-            hh, mm = map(int, t.split(":"))
-            dt = datetime(today.year, today.month, today.day, hh, mm, tzinfo=pytz.timezone(TZ))
-            out.append(dt)
-        except Exception:
-            continue
-    return out
-
 async def _send_preview():
     rows = queue_list()
     if not rows:
@@ -400,25 +357,31 @@ async def _send_preview():
 
 async def scheduler_loop():
     logger.info("Scheduler запущен.")
-    last_preview_for: Dict[str, str] = {}  # ключ = 'YYYYMMDD HH:MM'
+    last_preview_for: Dict[str, str] = {}
 
     while True:
         try:
             tz = pytz.timezone(TZ)
             now = datetime.now(tz)
 
-            # Список сегодняшних точек
-            slots = _today_times_local()
+            # точки на сегодня
+            today = now.date()
+            slots: List[datetime] = []
+            for t in POST_TIMES:
+                try:
+                    hh, mm = map(int, t.split(":"))
+                    slots.append(tz.localize(datetime(today.year, today.month, today.day, hh, mm)))
+                except Exception:
+                    continue
+
             for dt in slots:
-                # превью
                 pv_key = dt.strftime("%Y%m%d %H:%M")
                 if dt - now <= timedelta(minutes=PREVIEW_BEFORE_MIN) and dt > now:
                     if pv_key not in last_preview_for:
                         await _send_preview()
                         last_preview_for[pv_key] = "sent"
 
-                # публикация в сам момент
-                if abs((dt - now).total_seconds()) < 30:  # окно 30 сек
+                if abs((dt - now).total_seconds()) < 30:
                     post = dequeue_oldest()
                     if post:
                         await publish_one(post)
