@@ -412,16 +412,18 @@ async def on_text(m: Message):
 
 # -------------------- Запуск --------------------
 
-async def run_bot():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
-    )
+aasync def run_bot():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
     db_init()
     logger.info("🚀 Стартуем Layoutplace Bot...")
     logger.info("Scheduler TZ=%s, times=%s, preview_before=%s мин", TZ, POST_TIMES, PREVIEW_BEFORE_MIN)
+
+    # 👉 критично для устранения 409, если вдруг активен webhook
+    await bot.delete_webhook(drop_pending_updates=False)
+
     asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(run_bot())
