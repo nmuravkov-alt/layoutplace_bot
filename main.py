@@ -1,389 +1,367 @@
-# main.py
-import os
-import json
-import time
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict, Any
 
 import pytz
-import sqlite3
-
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, InputMediaPhoto
-from aiogram.filters import Command, CommandStart
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 
-# -------------------- Конфиг из ENV --------------------
+# ---------------------------
+# Логи
+# ---------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("layoutplace_bot")
+
+# ---------------------------
+# ENV
+# ---------------------------
 TOKEN = os.getenv("TOKEN", "").strip()
 if not TOKEN or ":" not in TOKEN:
     raise RuntimeError("ENV TOKEN пуст или имеет неверный формат. Задайте корректный токен бота.")
 
-ADMINS = []
-_raw_admins = os.getenv("ADMINS", "").replace(" ", "")
-if _raw_admins:
-    for chunk in _raw_admins.split(","):
-        if chunk.isdigit():
-            ADMINS.append(int(chunk))
-        else:
-            # игнорируем мусор
-            pass
-if not ADMINS:
-    logging.warning("ADMINS не задан — превью и уведомления в ЛС отправляться не будут.")
-
-CHANNEL_ID_ENV = os.getenv("CHANNEL_ID", "").strip()
-try:
-    CHANNEL_ID = int(CHANNEL_ID_ENV)
-except Exception:
-    raise RuntimeError(
-        f"ENV CHANNEL_ID должен быть числом вида -100..., сейчас: {CHANNEL_ID_ENV!r}"
-    )
-
-TZ = os.getenv("TZ", "Europe/Moscow").strip()
-ALBUM_URL = os.getenv("ALBUM_URL", "").strip()
-BUY_CONTACT = os.getenv("BUY_CONTACT", "@layoutplacebuy").strip()
-DB_PATH = os.getenv("DB_PATH", "/data/bot.db").strip()
-
-# Расписание (часы/минуты локальной TZ)
-SLOTS = [(12, 0), (16, 0), (20, 0)]
-PREVIEW_BEFORE_MIN = 45
-
-# -------------------- Логирование --------------------
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("layoutplace_bot")
-log_sched = logging.getLogger("layoutplace_scheduler")
-
-# -------------------- Бот/Диспетчер --------------------
-bot = Bot(TOKEN)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
-
-# -------------------- База данных (SQLite) --------------------
-def _connect() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    cx = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
-    cx.row_factory = sqlite3.Row
-    return cx
-
-def init_db() -> None:
-    cx = _connect()
-    cx.execute("""
-        CREATE TABLE IF NOT EXISTS queue(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          items_json TEXT NOT NULL,      -- список dict с типом/фото file_id
-          caption    TEXT,
-          src_chat_id INTEGER,           -- исходный канал (если переслано)
-          src_msg_id  INTEGER,           -- id исходного поста
-          created_at  INTEGER NOT NULL
-        )
-    """)
-    cx.close()
-
-def enqueue(items: List[Dict[str, Any]], caption: str, src: Optional[Tuple[int,int]]) -> int:
-    cx = _connect()
-    cur = cx.cursor()
-    src_chat_id, src_msg_id = (src or (None, None))
-    cur.execute("""
-        INSERT INTO queue(items_json, caption, src_chat_id, src_msg_id, created_at)
-        VALUES(?,?,?,?,?)
-    """, (json.dumps(items, ensure_ascii=False), caption, src_chat_id, src_msg_id, int(time.time())))
-    qid = cur.lastrowid
-    cx.close()
-    return qid
-
-def dequeue_oldest() -> Optional[sqlite3.Row]:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT * FROM queue ORDER BY id LIMIT 1")
-    row = cur.fetchone()
-    if row:
-        cur.execute("DELETE FROM queue WHERE id=?", (row["id"],))
-        cx.commit()
-    cx.close()
-    return row
-
-def get_count() -> int:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT COUNT(*) AS c FROM queue")
-    c = cur.fetchone()["c"]
-    cx.close()
-    return int(c)
-
-def peek_oldest() -> Optional[sqlite3.Row]:
-    cx = _connect()
-    cur = cx.cursor()
-    cur.execute("SELECT * FROM queue ORDER BY id LIMIT 1")
-    row = cur.fetchone()
-    cx.close()
-    return row
-
-# -------------------- Нормализация текста --------------------
-def _clean_text(s: str) -> str:
-    # убираем лишние пробелы, двойные переносы, хвосты
-    s = s.replace("\r", "")
-    lines = [ln.strip() for ln in s.split("\n")]
-    # фильтруем пустые в начале/конце, но сохраняем одинарные пустые внутри
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    # склеиваем, убираем двойные пустые
-    out = []
-    prev_empty = False
-    for ln in lines:
-        empty = (ln == "")
-        if empty and prev_empty:
-            continue
-        out.append(ln)
-        prev_empty = empty
-    return "\n".join(out).strip()
-
-def _strip_footer_block(text: str) -> str:
-    # вырезает старые "Общий альбом/Покупка/вопросы", если уже есть
-    low = text.lower()
-    markers = ["общий альбом", "покупка/вопросы", "покупка / вопросы"]
-    cut_index = None
-    for m in markers:
-        idx = low.rfind(m)
-        if idx != -1:
-            cut_index = idx if (cut_index is None or idx < cut_index) else cut_index
-    if cut_index is not None:
-        return text[:cut_index].rstrip()
-    return text
-
-def format_caption(raw: str) -> str:
-    base = _clean_text(raw or "")
-    base = _strip_footer_block(base)
-    footer_lines = []
-    if ALBUM_URL:
-        footer_lines.append(f"Общий альбом: {ALBUM_URL}")
-    if BUY_CONTACT:
-        footer_lines.append(f"Покупка/вопросы: {BUY_CONTACT}")
-    footer = "\n".join(footer_lines)
-    if footer:
-        return f"{base}\n\n{footer}"
-    return base
-
-# -------------------- Утилиты Telegram --------------------
-def _src_tuple(m: Message) -> Optional[Tuple[int, int]]:
-    # безопасно достаём источник при пересылке из канала
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+# допускаем @username или -100...
+if CHANNEL_ID.startswith("@"):
+    TARGET_CHAT = CHANNEL_ID  # username канала
+else:
+    # пробуем привести к int
     try:
-        if m.forward_from_chat and getattr(m.forward_from_chat, "type", None) == "channel":
-            # aiogram 3 хранит type строкой
-            return (m.forward_from_chat.id, m.forward_from_message_id)
+        TARGET_CHAT = int(CHANNEL_ID)
     except Exception:
-        pass
-    return None
+        raise RuntimeError("ENV CHANNEL_ID должен быть @username или -100XXXXXXXXXX")
 
-async def _notify_admins(text: str) -> None:
+ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",") if x.strip().isdigit()]
+if not ADMINS:
+    log.warning("ADMINS не задан — превью/уведомления прислать будет некому.")
+
+TZ = os.getenv("TZ", "Europe/Moscow")
+POST_TIMES = [t.strip() for t in os.getenv("POST_TIMES", "12:00,16:00,20:00").split(",") if t.strip()]
+PREVIEW_MINUTES = int(os.getenv("PREVIEW_MINUTES", "45"))
+
+# Единый хвост поста (можно править ENV-ами при желании)
+ALBUM_URL = os.getenv("ALBUM_URL", "https://vk.com/market-222108341?screen=group&section=album_26")
+CONTACT_TEXT = os.getenv("CONTACT_TEXT", "@layoutplacebuy")
+
+bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher()
+
+# ---------------------------
+# Очередь постов (в памяти)
+# Элемент: {"items":[{"type":"photo","file_id":...}, ...], "caption": "..."}
+# ---------------------------
+QUEUE: list[dict] = []
+
+# ---------------------------
+# Буфер альбомов: по пользователю храним текущую сборку
+# KEY: user_id
+# VALUE: {"mg_id": str, "items": [...], "caption": str, "ts": float}
+# ---------------------------
+ALBUM_BUFFER: dict[int, dict] = {}
+
+ALBUM_COLLECT_WINDOW = 1.0  # секунды ожидания довлета всех частей альбома
+
+
+# ===========================
+# ========= УТИЛЫ ===========
+# ===========================
+
+def build_caption(raw: str) -> str:
+    """
+    Приводим к общему виду: добавляем внизу неизменяемые строки.
+    Без эмодзи — оставляем как есть, только добавляем хвост.
+    """
+    raw = (raw or "").strip()
+
+    tail = (
+        "\n\n"
+        f"Общий альбом: {ALBUM_URL}\n"
+        f"Покупка/вопросы: {CONTACT_TEXT}"
+    )
+    # Не дублируем, если пользователь сам вставил хвост
+    if "Покупка/вопросы:" in raw or "Общий альбом:" in raw:
+        return raw
+    return (raw + tail).strip()
+
+
+def _pick_preview_text(items: list[dict], caption: str) -> str:
+    photos = sum(1 for x in items if x["type"] == "photo")
+    base = caption.strip() or "(без подписи)"
+    prefix = f"Фотографий: {photos}\n\n" if photos else ""
+    return prefix + base
+
+
+async def _notify_admins(text: str):
     for aid in ADMINS:
         try:
-            await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+            await bot.send_message(aid, text, disable_web_page_preview=True)
         except Exception as e:
-            log.warning(f"Админ {aid} недоступен: {e}")
+            log.warning(f"Не удалось отправить админу {aid}: {e}")
 
-async def _send_preview(row: sqlite3.Row) -> None:
-    try:
-        items = json.loads(row["items_json"])
-        caption = row["caption"] or ""
-        text = format_caption(caption)
-        # превью: шлём только первому админу одну фотку с текстом, остальным — текст+счётчик
-        if ADMINS:
-            try:
-                # если есть фото — приложим
-                first_photo = None
-                for it in items:
-                    if it.get("type") == "photo":
-                        first_photo = it.get("file_id")
-                        break
-                if first_photo:
-                    await bot.send_photo(ADMINS[0], first_photo, caption=text, parse_mode=ParseMode.HTML)
-                else:
-                    await bot.send_message(ADMINS[0], text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-            except Exception as e:
-                log.warning(f"Превью админу {ADMINS[0]}: {e}")
-            # остальным просто текст
-            for aid in ADMINS[1:]:
-                try:
-                    await bot.send_message(aid, text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-                except Exception as e:
-                    log.warning(f"Превью админу {aid}: {e}")
-    except Exception as e:
-        log.warning(f"Не удалось сформировать превью: {e}")
 
-async def _post_row(row: sqlite3.Row) -> None:
-    items = json.loads(row["items_json"])
-    caption = format_caption(row["caption"] or "")
-    # отправка
-    media = [it for it in items if it.get("type") == "photo"]
-    sent = None
-    if len(media) <= 1:
-        if media:
-            sent = await bot.send_photo(CHANNEL_ID, media[0]["file_id"], caption=caption, parse_mode=ParseMode.HTML)
-        else:
-            # на всякий — просто текст
-            sent = await bot.send_message(CHANNEL_ID, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-    else:
-        # альбом
-        group = []
-        for i, it in enumerate(media):
-            if i == 0:
-                group.append(InputMediaPhoto(type="photo", media=it["file_id"], caption=caption, parse_mode=ParseMode.HTML))
+async def _delete_last_in_channel():
+    """
+    Мягко пытаемся удалить последнее сообщение в канале, чтобы не было дублей.
+    Для username-канала Telegram не даёт получить историю через get_chat_history,
+    поэтому используем chat.get_updates — в aiogram нет готового. Делать нельзя.
+    Решение: делаем «мягкое удаление» только для id-каналов (supergroup/private).
+    """
+    if isinstance(TARGET_CHAT, int):
+        try:
+            # Получить последнее сообщение нельзя напрямую,
+            # но можно попытаться удалить «предыдущее» опубликованное нами,
+            # если мы его сохранили. Для простоты — пропускаем.
+            pass
+        except Exception:
+            pass
+    # Ничего не делаем для username-каналов — Telegram API ограничивает.
+
+
+async def publish_to_channel(items: list[dict], caption: str) -> list[int]:
+    """
+    Публикует пост в канал (или один медиа, или альбом).
+    Возвращает список message_id опубликованных сообщений.
+    """
+    await _delete_last_in_channel()  # «мягкое» — см. комментарий внутри
+
+    published_ids: list[int] = []
+    safe_caption = caption.strip()
+
+    photos = [it for it in items if it["type"] == "photo"]
+
+    # 1 фото
+    if len(photos) == 1:
+        msg = await bot.send_photo(TARGET_CHAT, photos[0]["file_id"], caption=safe_caption)
+        published_ids.append(msg.message_id)
+
+    # альбом
+    elif len(photos) > 1:
+        media = []
+        for idx, ph in enumerate(photos):
+            if idx == 0:
+                media.append(InputMediaPhoto(media=ph["file_id"], caption=safe_caption))
             else:
-                group.append(InputMediaPhoto(type="photo", media=it["file_id"]))
-        res = await bot.send_media_group(CHANNEL_ID, group)
-        sent = res[0] if res else None
+                media.append(InputMediaPhoto(media=ph["file_id"]))
+        msgs = await bot.send_media_group(TARGET_CHAT, media=media)
+        published_ids.extend(m.message_id for m in msgs)
 
-    # попробовать удалить исходный пост в канале
-    if row["src_chat_id"] and row["src_msg_id"]:
-        try:
-            await bot.delete_message(row["src_chat_id"], row["src_msg_id"])
-        except Exception as e:
-            log_sched.warning(f"Не смог удалить старое сообщение {row['src_chat_id']}/{row['src_msg_id']}: {e}")
+    # без фото — текст
+    else:
+        msg = await bot.send_message(TARGET_CHAT, safe_caption, disable_web_page_preview=True)
+        published_ids.append(msg.message_id)
 
-# -------------------- Сборка медиа/альбомов --------------------
-# Буфер альбомов по media_group_id: { id: {"items":[{type,file_id},...], "caption":str, "src":(chat,msg)} }
-_album_buffer: Dict[str, Dict[str, Any]] = {}
+    # уведомление админам
+    await _notify_admins("✅ Пост опубликован.\n\n" + safe_caption[:1000])
+    return published_ids
 
-def _append_photo_item(items: List[Dict[str, Any]], m: Message) -> None:
-    # берём максимальный размер фото
+
+def _merge_album_piece(user_id: int, msg: Message):
+    """Сливаем очередной кусок альбома в буфер для этого пользователя."""
+    mg_id = msg.media_group_id
+    if not mg_id:
+        return
+
+    buf = ALBUM_BUFFER.get(user_id)
+    if not buf or buf.get("mg_id") != mg_id:
+        # создаём новый буфер
+        ALBUM_BUFFER[user_id] = {
+            "mg_id": mg_id,
+            "items": [],
+            "caption": msg.caption or "",
+            "ts": asyncio.get_running_loop().time(),
+        }
+        buf = ALBUM_BUFFER[user_id]
+
+    # файлик
+    if msg.photo:
+        buf["items"].append({"type": "photo", "file_id": msg.photo[-1].file_id})
+
+    # захватываем подпись только если она появилась и ранее пустая
+    if msg.caption and not buf.get("caption"):
+        buf["caption"] = msg.caption
+
+    # обновляем таймштамп
+    buf["ts"] = asyncio.get_running_loop().time()
+
+
+async def _finalize_album_later(user_id: int, mg_id: str):
+    """Через ALBUM_COLLECT_WINDOW секунд считаем, что альбом собран."""
+    await asyncio.sleep(ALBUM_COLLECT_WINDOW)
+    buf = ALBUM_BUFFER.get(user_id)
+    if not buf:
+        return
+    if buf.get("mg_id") != mg_id:
+        return
+    # просто держим буфер — команда /add_post его подхватит
+    # чистить не будем до /add_post (или 2 минуты неактивности)
+
+
+def _get_ready_album_from_buffer(user_id: int) -> tuple[list[dict], str] | None:
+    """Если в буфере есть актуальный альбом (за последние ~120с) — возвращаем его."""
+    buf = ALBUM_BUFFER.get(user_id)
+    if not buf:
+        return None
+    now = asyncio.get_running_loop().time()
+    if now - buf.get("ts", 0) > 120:
+        # протух
+        ALBUM_BUFFER.pop(user_id, None)
+        return None
+    items = buf.get("items", [])
+    caption = buf.get("caption") or ""
+    if items:
+        # НЕ очищаем — на случай, если пользователь нажмёт /add_post повторно по ошибке.
+        return items, caption
+    return None
+
+
+def _extract_single_from_message(m: Message) -> tuple[list[dict], str]:
+    """Извлекаем ОДНО фото и подпись из конкретного сообщения (не альбом)."""
+    items: list[dict] = []
+    caption = m.caption or m.text or ""
     if m.photo:
-        fid = m.photo[-1].file_id
-        items.append({"type": "photo", "file_id": fid})
+        items.append({"type": "photo", "file_id": m.photo[-1].file_id})
+    return items, caption
 
-# -------------------- Команды --------------------
-@router.message(CommandStart())
+
+# ===========================
+# ======= ХЕНДЛЕРЫ =========
+# ===========================
+
+@dp.message(Command("start"))
 async def cmd_start(m: Message):
-    help_text = (
-        "Привет! Я помогу с очередью постов.\n\n"
-        "/add_post — пересылай мне пост из канала (фото/альбом + подпись), я добавлю в очередь\n"
-        "/post_oldest — запостить самый старый из очереди вручную\n"
-        "/queue — показать, сколько постов в очереди\n"
-        "/help — краткая справка\n\n"
-        "Важно: чтобы получать превью в ЛС за 45 минут до слота, сначала нажми здесь /start."
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Постить сейчас (самый старый)", callback_data="post_oldest")
+    ]])
+    text = (
+        "Привет! Перешли мне пост из канала (с фото/альбомом и описанием), затем отправь /add_post — "
+        "я добавлю его в очередь и опубликую по расписанию (12:00 / 16:00 / 20:00). "
+        f"За {PREVIEW_MINUTES} минут до выхода пришлю превью в личку админам.\n\n"
+        "Команды:\n"
+        "• /add_post — добавить последний пересланный пост (или альбом) в очередь\n"
+        "• /post_oldest — вручную опубликовать самый старый пост из очереди\n"
+        "• /queue — показать размер очереди\n"
     )
-    await m.answer(help_text, disable_web_page_preview=True)
+    await m.answer(text, reply_markup=kb)
 
-@router.message(Command("help"))
-async def cmd_help(m: Message):
-    await cmd_start(m)
 
-@router.message(Command("queue"))
+@dp.callback_query(F.data == "post_oldest")
+async def cq_post_oldest(cq: types.CallbackQuery):
+    await _post_oldest_impl(cq.message)
+    await cq.answer("Опубликовано")
+
+
+@dp.message(Command("queue"))
 async def cmd_queue(m: Message):
-    await m.answer(f"В очереди: {get_count()}.")
+    await m.answer(f"В очереди: {len(QUEUE)}.")
 
-@router.message(Command("post_oldest"))
-async def cmd_post_oldest(m: Message):
-    if m.from_user and m.from_user.id not in ADMINS:
-        return
-    row = dequeue_oldest()
-    if not row:
-        await m.answer("Очередь пустая.")
-        return
-    await _post_row(row)
-    await m.answer("Опубликовано.")
 
-@router.message(Command("add_post"))
+@dp.message(F.media_group_id)
+async def on_any_album_piece(m: Message):
+    """
+    Любая часть альбома попадает сюда: складываем в буфер и запускаем таймер.
+    Это нужно, чтобы потом /add_post смог забрать весь альбом целиком.
+    """
+    user_id = m.from_user.id
+    _merge_album_piece(user_id, m)
+    asyncio.create_task(_finalize_album_later(user_id, m.media_group_id))
+
+
+@dp.message(Command("add_post"))
 async def cmd_add_post(m: Message):
-    if m.from_user and m.from_user.id not in ADMINS:
-        return
-    # поддерживаем: пересланное из канала фото/альбом, либо сообщение с media_group_id
-    src = _src_tuple(m)
-    items: List[Dict[str, Any]] = []
-    cap = (m.caption or m.text or "").strip()
+    """
+    Добавляет пост в очередь.
+    Логика:
+      1) если недавно пересылали альбом — забираем его из буфера
+      2) иначе берём одиночное сообщение (реплай или сам m)
+    """
+    user_id = m.from_user.id
 
-    if m.media_group_id:
-        key = str(m.media_group_id)
-        buf = _album_buffer.get(key, {"items": [], "caption": "", "src": src})
-        _append_photo_item(buf["items"], m)
-        if cap and not buf["caption"]:
-            buf["caption"] = cap
-        _album_buffer[key] = buf
-        # подождём 1 секунду, чтобы собрать весь альбом
-        await asyncio.sleep(1.0)
-        buf_final = _album_buffer.pop(key, None)
-        if not buf_final or not buf_final["items"]:
-            await m.answer("Не удалось собрать альбом.")
-            return
-        qid = enqueue(buf_final["items"], buf_final["caption"], buf_final["src"])
-        await m.answer(f"Добавлено в очередь (альбом). ID={qid}. Сейчас в очереди: {get_count()}.")
+    # 1) пробуем взять готовый альбом
+    ready = _get_ready_album_from_buffer(user_id)
+    if ready:
+        items, caption = ready
+    else:
+        # 2) одиночное
+        src = m.reply_to_message or m
+        items, caption = _extract_single_from_message(src)
+
+    if not items and not caption:
+        await m.answer("❌ Не нашёл ни фото/альбома, ни текста. Перешли пост и снова /add_post.")
         return
 
-    # одиночное фото/сообщение
-    _append_photo_item(items, m)
-    if not items and not cap:
-        await m.answer("Пришли пересланный пост из канала: фото/альбом + подпись.")
+    final_caption = build_caption(caption)
+    QUEUE.append({"items": items, "caption": final_caption})
+    await m.answer("✅ Пост добавлен в очередь.")
+
+
+@dp.message(Command("post_oldest"))
+async def cmd_post_oldest(m: Message):
+    await _post_oldest_impl(m)
+
+
+async def _post_oldest_impl(m: Message):
+    if not QUEUE:
+        await m.answer("Очередь пуста.")
         return
-    qid = enqueue(items, cap, src)
-    await m.answer(f"Добавлено в очередь. ID={qid}. Сейчас в очереди: {get_count()}.")
+    task = QUEUE.pop(0)
+    await publish_to_channel(task["items"], task["caption"])
+    await m.answer("📢 Старый пост опубликован.")
 
-# -------------------- Автослот + превью --------------------
-def _now_tz():
-    try:
-        tz = pytz.timezone(TZ)
-    except Exception:
-        tz = pytz.timezone("Europe/Moscow")
-    return datetime.now(tz)
 
-def _today_slots() -> List[datetime]:
-    now = _now_tz()
-    tz = now.tzinfo
-    return [now.replace(hour=h, minute=m, second=0, microsecond=0) for (h, m) in SLOTS]
+# ===========================
+# ======= ПЛАНИРОВЩИК =======
+# ===========================
 
-def _next_slot_after(dt: datetime) -> datetime:
-    # ближайший слот >= dt; если все прошли — завтра первый
-    slots = _today_slots()
-    for s in slots:
-        if s >= dt:
-            return s
-    return (slots[0] + timedelta(days=1))
+async def scheduler():
+    tz = pytz.timezone(TZ)
+    log.info(f"Scheduler TZ={TZ}, times={','.join(POST_TIMES)}, preview_before={PREVIEW_MINUTES} min")
+    seen_preview_for_minute: set[str] = set()  # защита от дублей превью в одну минуту
+    seen_post_for_minute: set[str] = set()     # защита от дублей поста в одну минуту
 
-_last_preview_for: Optional[datetime] = None
-_last_post_for: Optional[datetime] = None
-
-async def scheduler_loop():
-    log.info(f"Scheduler TZ={TZ}, times=" + ",".join([f"{h:02d}:{m:02d}" for h, m in SLOTS]) + f", preview_before={PREVIEW_BEFORE_MIN} min")
-    await asyncio.sleep(2)
-
-    global _last_preview_for, _last_post_for
     while True:
-        try:
-            now = _now_tz()
-            slot = _next_slot_after(now - timedelta(minutes=PREVIEW_BEFORE_MIN))
-            preview_time = slot - timedelta(minutes=PREVIEW_BEFORE_MIN)
+        now = datetime.now(tz)
+
+        for t_str in POST_TIMES:
+            hh, mm = map(int, t_str.split(":"))
+            slot_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+            # если слот уже прошёл сегодня — сдвигаем на завтра при сравнении
+            if slot_dt < now - timedelta(minutes=61):
+                slot_dt = slot_dt + timedelta(days=1)
+
+            # превью-окно
+            preview_dt = slot_dt - timedelta(minutes=PREVIEW_MINUTES)
+
+            # ключи для «один раз в минуту»
+            prev_key = f"{preview_dt:%Y%m%d%H%M}"
+            post_key = f"{slot_dt:%Y%m%d%H%M}"
 
             # превью
-            if now >= preview_time and (_last_preview_for is None or preview_time > _last_preview_for):
-                row = peek_oldest()
-                if row:
-                    await _send_preview(row)
-                _last_preview_for = preview_time
+            if now.strftime("%Y%m%d%H%M") == prev_key and prev_key not in seen_preview_for_minute:
+                seen_preview_for_minute.add(prev_key)
+                if QUEUE:
+                    preview_text = _pick_preview_text(QUEUE[0]["items"], QUEUE[0]["caption"])
+                    await _notify_admins(f"⏰ Через {PREVIEW_MINUTES} минут запланирован пост:\n\n{preview_text[:1500]}")
 
             # публикация
-            if now >= slot and (_last_post_for is None or slot > _last_post_for):
-                row2 = dequeue_oldest()
-                if row2:
-                    await _post_row(row2)
-                _last_post_for = slot
+            if now.strftime("%Y%m%d%H%M") == post_key and post_key not in seen_post_for_minute:
+                seen_post_for_minute.add(post_key)
+                if QUEUE:
+                    task = QUEUE.pop(0)
+                    await publish_to_channel(task["items"], task["caption"])
 
-        except Exception as e:
-            log_sched.error(f"Ошибка в планировщике: {e}")
+        await asyncio.sleep(2)  # частота проверки
 
-        await asyncio.sleep(10)  # частота опроса
 
-# -------------------- Точка входа --------------------
-async def _run():
-    init_db()
-    # запускаем планировщик в фоне
-    asyncio.create_task(scheduler_loop())
-    log.info("Starting bot instance...")
+# ===========================
+# ========== RUN ============
+# ===========================
+
+async def run_bot():
+    asyncio.create_task(scheduler())
     await dp.start_polling(bot)
 
-# совместимость с runner.py (import run_bot)
-run_bot = _run
-
 if __name__ == "__main__":
-    asyncio.run(_run())
+    asyncio.run(run_bot())
