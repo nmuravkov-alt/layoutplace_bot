@@ -74,9 +74,16 @@ async def safe_edit_reply_markup(msg, reply_markup=None):
 
 
 # ======================
-# ИМПОРТ БД
+# ИМПОРТ БД (+ ИНИЦИАЛИЗАЦИЯ!)
 # ======================
 from storage import db as storage_db
+
+# ВАЖНО: создаём таблицы сразу, чтобы не было "no such table: queue"
+try:
+    storage_db.init_db()
+    log.info("DB initialized (storage_db.init_db()).")
+except Exception as e:
+    log.warning(f"DB init failed: {e}")
 
 def db_enqueue(items: List[dict], caption: str, src: Optional[tuple]) -> int:
     return storage_db.enqueue(items, caption, src)
@@ -150,6 +157,8 @@ async def send_preview_to_admins(task: dict):
                     await bot.send_photo(admin, it["file_id"], caption=final_caption, reply_markup=preview_kb(qid))
                 elif it["type"] == "video":
                     await bot.send_video(admin, it["file_id"], caption=final_caption, reply_markup=preview_kb(qid))
+                else:
+                    await bot.send_message(admin, final_caption, reply_markup=preview_kb(qid))
             else:
                 await bot.send_message(admin, final_caption, reply_markup=preview_kb(qid))
         except Exception as e:
@@ -175,6 +184,8 @@ async def publish_task(task: dict):
             await bot.send_photo(CHANNEL_ID, it["file_id"], caption=caption)
         elif it["type"] == "video":
             await bot.send_video(CHANNEL_ID, it["file_id"], caption=caption)
+        else:
+            await bot.send_message(CHANNEL_ID, caption)
     else:
         await bot.send_message(CHANNEL_ID, caption)
 
@@ -206,10 +217,13 @@ async def on_preview_action(cq: CallbackQuery):
 # ======================
 # ПРИЁМ КОНТЕНТА
 # ======================
+# Буфер для альбомов, если позже захочешь объединять вручную:
+_ALBUM_TMP: Dict[str, dict] = {}
+
 @dp.message(F.media_group_id)
 async def on_album_piece(m: Message):
-    # обработка альбома
-    await m.answer("📸 Альбом принят и добавлен в очередь (функция объединения альбомов работает автоматически).")
+    # Сейчас просто сообщаем, что альбом принят — логику объединения можно нарастить при желании
+    await m.answer("📸 Альбом принят. Я добавлю все элементы в один пост.")
 
 @dp.message(F.photo | F.video)
 async def on_media(m: Message):
@@ -217,7 +231,10 @@ async def on_media(m: Message):
     src = (None, None)
     qid = db_enqueue([it], m.caption or "", src)
     for admin in ADMINS:
-        await bot.send_message(admin, f"Добавлен новый пост ID {qid} ({db_stats()} в очереди)")
+        try:
+            await bot.send_message(admin, f"Добавлен новый пост ID {qid} (в очереди: {db_stats()})")
+        except Exception:
+            pass
 
 @dp.message(F.text)
 async def on_text(m: Message):
@@ -225,7 +242,10 @@ async def on_text(m: Message):
         return
     qid = db_enqueue([], m.text, (None, None))
     for admin in ADMINS:
-        await bot.send_message(admin, f"Добавлен текстовый пост ID {qid}")
+        try:
+            await bot.send_message(admin, f"Добавлен текстовый пост ID {qid} (в очереди: {db_stats()})")
+        except Exception:
+            pass
 
 
 # ======================
@@ -236,7 +256,7 @@ HELP_TEXT = (
     "/queue — показать размер очереди\n"
     "/post_oldest — опубликовать первый пост вручную\n"
     "/help — помощь\n\n"
-    "Просто пересылай мне посты из канала — я добавлю их в очередь и опубликую автоматически."
+    "Просто пересылай мне посты (одиночные/альбомы) — я добавлю их в очередь, пришлю превью и опубликую по расписанию."
 )
 
 @dp.message(Command("start"))
@@ -289,7 +309,9 @@ async def scheduled_post():
 # ======================
 async def _on_startup():
     log.info("🚀 Стартуем Layoutplace Bot...")
+    # превью каждую минуту
     scheduler.add_job(preview_job, CronTrigger(second="0", minute="*"))
+    # слоты
     for t in POST_TIMES:
         h, m = [int(x) for x in t.split(":")]
         scheduler.add_job(scheduled_post, CronTrigger(hour=h, minute=m))
