@@ -3,7 +3,7 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Callable
 
 import pytz
 from aiogram import Bot, Dispatcher, F
@@ -19,6 +19,9 @@ from aiogram.types import (
     InputMediaVideo,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -60,36 +63,30 @@ scheduler = AsyncIOScheduler(timezone=tz)
 # ======================
 # АДАПТЕР ДЛЯ БД
 # ======================
-# Ожидаем таблицу queue с полями:
-# id INTEGER PK, items_json TEXT, caption TEXT, src_chat_id INTEGER NULL, src_msg_id INTEGER NULL, created_at INTEGER
-# и функции:
-# - peek_oldest(): dict | None
-# - dequeue_oldest(): dict | None
-# - remove_by_id(qid: int) -> None
-# - enqueue(items: list[dict], caption: str, src: tuple[int|None,int|None]) -> int
-# - get_count() -> int
+# ожидаемые функции в storage/db.py (имена могут отличаться — подхватываем варианты):
+# init_db(), peek_oldest()/get_oldest(), dequeue_oldest(), remove_by_id()/delete_post(),
+# enqueue()/add_post(), get_count(), get_queue()/list_queue()/list_all()
 
 def _import_db():
-    # пытаемся разные имена из твоих прошлых версий
     mod = __import__("storage.db", fromlist=["*"])
 
-    def pick(*names):
+    def pick(*names: str) -> Optional[Callable]:
         for n in names:
             if hasattr(mod, n):
                 return getattr(mod, n)
         return None
 
     return {
-        "init_db": pick("init_db"),
-        "peek_oldest": pick("peek_oldest", "get_oldest"),
-        "dequeue_oldest": pick("dequeue_oldest"),
-        "remove_by_id": pick("remove_by_id", "delete_post"),
-        "enqueue": pick("enqueue", "add_post"),
-        "get_count": pick("get_count"),
+        "init_db":       pick("init_db"),
+        "peek_oldest":   pick("peek_oldest", "get_oldest"),
+        "dequeue_oldest":pick("dequeue_oldest"),
+        "remove_by_id":  pick("remove_by_id", "delete_post"),
+        "enqueue":       pick("enqueue", "add_post"),
+        "get_count":     pick("get_count"),
+        "list_queue":    pick("get_queue", "list_queue", "list_all"),
     }
 
 _db = _import_db()
-
 if _db["init_db"]:
     try:
         _db["init_db"]()
@@ -104,11 +101,15 @@ def db_dequeue_oldest() -> Optional[dict]:
     f = _db["dequeue_oldest"]
     return f() if f else None
 
-def db_remove_by_id(qid: int):
+def db_remove_by_id(qid: int) -> bool:
     f = _db["remove_by_id"]
     if not f:
         raise RuntimeError("remove_by_id() не найден в storage.db")
-    return f(qid)
+    try:
+        f(qid)
+        return True
+    except Exception:
+        return False
 
 def db_enqueue(items: List[dict], caption: str, src: Optional[tuple]) -> int:
     """
@@ -119,18 +120,16 @@ def db_enqueue(items: List[dict], caption: str, src: Optional[tuple]) -> int:
     f = _db["enqueue"]
     if not f:
         raise RuntimeError("enqueue() / add_post() не найден в storage.db")
-    # попробуем разные сигнатуры
+    # под разные сигнатуры
     try:
         return f(items=items, caption=caption, src=src)
     except TypeError:
         try:
-            # некоторые версии ожидают распакованные значения
             if src is None:
                 return f(items=items, caption=caption, src_chat_id=None, src_msg_id=None)
             else:
                 return f(items=items, caption=caption, src_chat_id=src[0], src_msg_id=src[1])
         except TypeError:
-            # самые старые могли принимать payload/json
             payload = json.dumps(items, ensure_ascii=False)
             return f(payload=payload, caption=caption, src=src)
 
@@ -140,6 +139,15 @@ def db_get_count() -> int:
         return int(f()) if f else 0
     except Exception:
         return 0
+
+def db_list_queue() -> List[dict]:
+    f = _db["list_queue"]
+    try:
+        rows = f() if f else []
+        # ожидаем поля: id, created_at
+        return rows or []
+    except Exception:
+        return []
 
 # ======================
 # ХЕЛПЕРЫ ДЛЯ ТЕКСТА/МЕДИА
@@ -186,6 +194,74 @@ def preview_kb(qid: int) -> InlineKeyboardMarkup:
     )
     kb.row(InlineKeyboardButton(text="🗑 Удалить", callback_data=f"preview:delete:{qid}"))
     return kb.as_markup()
+
+# ======================
+# МЕНЮ: КНОПКИ + ХЕНДЛЕРЫ
+# ======================
+
+def menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить пост",  callback_data="menu:add_post"),
+         InlineKeyboardButton(text="📋 Очередь",       callback_data="menu:queue")],
+        [InlineKeyboardButton(text="📤 Постить старый", callback_data="menu:post_oldest"),
+         InlineKeyboardButton(text="❌ Удалить пост",   callback_data="menu:delete")],
+        [InlineKeyboardButton(text="🏠 Меню",           callback_data="menu:home")]
+    ])
+
+HELP_TEXT = (
+    "Это интерактивное меню. Выбирай действие на кнопках ниже 👇\n"
+    f"Расписание: {', '.join(POST_TIMES)} (превью за {PREVIEW_BEFORE_MIN} мин)\n"
+    "Альбом и контакт внизу подписи — фиксированы."
+)
+
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    await m.answer(HELP_TEXT, reply_markup=menu_kb(), disable_web_page_preview=True)
+
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    await m.answer(HELP_TEXT, reply_markup=menu_kb(), disable_web_page_preview=True)
+
+class DeleteWaiting(StatesGroup):
+    id = State()
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def on_menu(cq: CallbackQuery, state: FSMContext):
+    action = cq.data.split(":", 1)[1]
+    if action == "home":
+        await cq.message.edit_reply_markup(reply_markup=menu_kb())
+        await cq.answer()
+        return
+    if action == "add_post":
+        await cq.message.answer("Перешли сюда пост/альбом — я сам поставлю в очередь.")
+        await cq.answer("Жду форвард")
+        return
+    if action == "queue":
+        txt = render_queue()
+        await cq.message.answer(txt)
+        await cq.answer("Очередь показана")
+        return
+    if action == "post_oldest":
+        msg = await cmd_post_oldest_inner()
+        await cq.message.answer(msg)
+        await cq.answer("Готово")
+        return
+    if action == "delete":
+        await state.set_state(DeleteWaiting.id)
+        await cq.message.answer("Введи ID из очереди для удаления (смотри /queue).")
+        await cq.answer()
+        return
+
+@dp.message(DeleteWaiting.id)
+async def do_delete_with_state(m: Message, state: FSMContext):
+    try:
+        item_id = int(m.text.strip().lstrip("#"))
+        ok = db_remove_by_id(item_id)
+        await m.answer("Удалено ✅" if ok else "Не найдено ❗")
+    except Exception:
+        await m.answer("Некорректный ID. Попробуй ещё раз.")
+        return
+    await state.clear()
 
 # ======================
 # ПУБЛИКАЦИЯ
@@ -319,11 +395,8 @@ async def on_preview_buttons(cq: CallbackQuery):
         await cq.message.answer(f"✅ Опубликовано и удалено из очереди: ID {qid}")
         await cq.answer()
     elif action == "delete":
-        try:
-            db_remove_by_id(qid)
-            await cq.message.answer(f"🗑 Удалено из очереди: ID {qid}")
-        except Exception as e:
-            await cq.message.answer(f"Не удалось удалить: {e}")
+        ok = db_remove_by_id(qid)
+        await cq.message.answer("🗑 Удалено из очереди" if ok else "Не удалось удалить")
         await cq.answer()
     else:
         await cq.answer("Оставил в очереди", show_alert=False)
@@ -418,8 +491,8 @@ async def on_single_media(m: Message):
 
 @dp.message(F.text & ~F.media_group_id)
 async def on_text(m: Message):
-    # Текстовый пост (редко, но поддержим)
-    txt = m.text.strip()
+    # Текстовый пост
+    txt = (m.text or "").strip()
     if txt.startswith("/"):
         return
     items = []  # без медиа
@@ -432,37 +505,42 @@ async def on_text(m: Message):
             pass
 
 # ======================
-# КОМАНДЫ
+# КОМАНДЫ (сервисные)
 # ======================
 
-HELP_TEXT = (
-    "Команды:\n"
-    "/queue — показать размер очереди\n"
-    "/post_oldest — опубликовать самый старый пост сейчас\n"
-    "/help — помощь\n\n"
-    "Просто пересылай мне посты (одиночные или альбомы) из канала — я положу в очередь, пришлю превью за 45 минут до слота и опубликую в указанное время."
-)
-
-@dp.message(Command("start"))
-async def cmd_start(m: Message):
-    await m.answer(HELP_TEXT, disable_web_page_preview=True)
-
-@dp.message(Command("help"))
-async def cmd_help(m: Message):
-    await m.answer(HELP_TEXT, disable_web_page_preview=True)
+def render_queue() -> str:
+    rows = db_list_queue()
+    if not rows:
+        cnt = db_get_count()
+        return "Очередь пуста." if cnt == 0 else f"В очереди: {cnt}"
+    lines = [f"Всего: {len(rows)}"]
+    for r in rows:
+        # поддержка разных форматов row (dict/sqlite row)
+        rid = r["id"] if isinstance(r, dict) else r[0]
+        created = r.get("created_at") if isinstance(r, dict) else (r[1] if len(r) > 1 else None)
+        stamp = ""
+        if created:
+            try:
+                stamp = datetime.fromtimestamp(int(created), tz).strftime("%d.%m %H:%M")
+            except Exception:
+                pass
+        lines.append(f"#{rid} [queued]{(' ' + stamp) if stamp else ''}")
+    return "\n".join(lines)
 
 @dp.message(Command("queue"))
 async def cmd_queue(m: Message):
-    await m.answer(f"В очереди: {db_get_count()}")
+    await m.answer(render_queue())
+
+async def cmd_post_oldest_inner() -> str:
+    task = db_dequeue_oldest()
+    if not task:
+        return "Очередь пуста."
+    await _publish_task(task)
+    return f"Опубликовано: ID {task['id']}"
 
 @dp.message(Command("post_oldest"))
 async def cmd_post_oldest(m: Message):
-    task = db_dequeue_oldest()
-    if not task:
-        await m.answer("Очередь пуста.")
-        return
-    await _publish_task(task)
-    await m.answer(f"Опубликовано: ID {task['id']}")
+    await m.answer(await cmd_post_oldest_inner())
 
 # ======================
 # СТАРТ
